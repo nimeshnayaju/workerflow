@@ -1,0 +1,11 @@
+{
+  "$schema": "./node_modules/oxfmt/configuration_schema.json",
+  "trailingComma": "none",
+  "printWidth": 120,
+  "experimentalSortPackageJson": false,
+  "jsdoc": {
+    "commentLineStrategy": "multiline",
+    "capitalizeDescriptions": true,
+    "descriptionWithDot": true
+  }
+}

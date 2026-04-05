@@ -1,0 +1,35 @@
+{
+  "name": "workerflow",
+  "description": "Durable execution engine, built on Cloudflare Workers",
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./definition": {
+      "types": "./dist/definition.d.ts",
+      "import": "./dist/definition.js"
+    }
+  },
+  "scripts": {
+    "build": "tsx ./scripts/build.ts",
+    "test": "vitest run",
+    "test:watch": "vitest watch",
+    "format": "oxfmt --write .",
+    "format:check": "oxfmt --check .",
+    "lint": "oxlint src/"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.14.1",
+    "@cloudflare/workers-types": "^4.20260402.1",
+    "oxfmt": "^0.43.0",
+    "oxlint": "^1.58.0",
+    "tsdown": "^0.21.7",
+    "tsx": "^4.21.0",
+    "turbo": "^2.9.3",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.2"
+  }
+}

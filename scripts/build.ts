@@ -1,0 +1,29 @@
+import { execSync } from "node:child_process";
+import { build } from "tsdown";
+
+async function main() {
+  await build({
+    clean: true,
+    dts: true,
+    target: "es2021",
+    entry: ["src/index.ts"],
+    deps: {
+      skipNodeModulesBundle: true,
+      neverBundle: ["cloudflare:workers"]
+    },
+    format: "esm",
+    sourcemap: true,
+    fixedExtension: false
+  });
+
+  // Format the generated .d.ts files using oxfmt
+  execSync("oxfmt --write ./dist/*.d.ts");
+
+  process.exit(0);
+}
+
+main().catch((err) => {
+  // Build failures should fail
+  console.error(err);
+  process.exit(1);
+});
