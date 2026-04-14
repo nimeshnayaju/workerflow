@@ -139,7 +139,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
   abstract execute(): Promise<void>;
 
-  async #processRunStepAttempt<T extends Json | undefined | void>(
+  async #processRunStepAttempt<T extends Json | ReadableStream<Uint8Array> | undefined | void>(
     stepId: RunStepId,
     ctx: WorkflowRuntimeContext,
     callback: () => Promise<T>
@@ -176,6 +176,32 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
     }
 
+    if (_result instanceof ReadableStream) {
+      /**
+       * Stream errors (e.g. producer abort, network failure mid-read) happen _during_ chunk consumption inside
+       * `handleRunAttemptStreamResult`, not inside the user callback. The attempt is still in `started` state at that
+       * point, so we can record a proper failure and schedule a retry just like a callback throw.
+       */
+      try {
+        const syntheticStream = await ctx.handleRunAttemptStreamResult(stepId, _result as ReadableStream<Uint8Array>);
+        this.#getRunStepFrame().numOfSuccessfulRunCallbacks += 1;
+        return syntheticStream as unknown as T;
+      } catch (streamError) {
+        const updated = await ctx.handleRunAttemptFailed(stepId, {
+          errorMessage: String(streamError),
+          errorName: streamError instanceof Error ? streamError.name : undefined
+        });
+
+        if (updated.nextAttemptAt === undefined) {
+          const error = new MaxAttemptsExceededError();
+          Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
+          throw error;
+        }
+
+        throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
+      }
+    }
+
     // SQL NULL (resultJson === null) encodes `undefined`; otherwise raw JSON.stringify for the value.
     const resultJson = _result === undefined ? null : JSON.stringify(_result);
     await ctx.handleRunAttemptSucceeded(stepId, resultJson);
@@ -184,7 +210,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
     return _result as T;
   }
 
-  protected async run<T extends Json | undefined | void>(
+  protected async run<T extends Json | ReadableStream<Uint8Array> | undefined | void>(
     id: string,
     callback: () => Promise<T>,
     config?: {
@@ -248,6 +274,11 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       }
     } else if (lastAttempt.state === "succeeded") {
       // Replay: the callback is NOT re-executed. Reconstruct the return value from durable state.
+      // For streams, this produces a synthetic ReadableStream backed by stored chunks.
+      if (lastAttempt.resultType === "stream") {
+        const stream = await ctx.getStoredStream(lastAttempt.id);
+        return stream as unknown as T;
+      }
       if (lastAttempt.resultType === "json") {
         return JSON.parse(lastAttempt.resultJson) as T;
       }

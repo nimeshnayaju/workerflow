@@ -2,13 +2,14 @@ import { DurableObject, RpcTarget } from "cloudflare:workers";
 import type { WorkflowDefinition } from "./definition";
 import type { Json } from "./json";
 import mig000 from "./migrations/0000_initial";
+import mig001 from "./migrations/0001_run_step_stream_results";
 import type { Brand } from "./brand";
 
 export abstract class WorkflowRuntime<
   TInput extends Json | undefined = Json | undefined,
   TVersion extends string = string
 > extends DurableObject {
-  private static readonly MIGRATIONS = [mig000];
+  private static readonly MIGRATIONS = [mig000, mig001];
   private readonly sql: SqlStorage;
   #status: WorkflowStatus;
   #isRunLoopActive: boolean = false;
@@ -805,7 +806,8 @@ export class WorkflowRuntimeContext extends RpcTarget {
    * Marks the in-flight attempt as succeeded.
    *
    * @param resultJson - Raw JSON string for the result value (`null` when the callback returned `undefined`). The
-   *   `result_type` discriminator is derived: `null` → `'none'`, non-null → `'json'`.
+   *   `result_type` discriminator is derived: `null` → `'none'`, non-null → `'json'`. Stream results bypass this method
+   *   entirely and go through `handleRunAttemptStreamResult`.
    */
   handleRunAttemptSucceeded(stepId: RunStepId, resultJson: string | null): SucceededRunStepAttempt {
     const [existing] = this.sql
@@ -875,6 +877,90 @@ export class WorkflowRuntimeContext extends RpcTarget {
       );
     });
   }
+
+  /**
+   * Consumes an entire `ReadableStream`, persists every chunk to `stream_chunks`, marks the in-flight attempt as
+   * succeeded with `result_type = 'stream'`, and returns a synthetic `ReadableStream` that reads from the just-stored
+   * chunks.
+   *
+   * Crash safety: the attempt stays in `started` state until the entire stream is consumed and all chunks are
+   * persisted. If this method throws (e.g. producer error, DO eviction), the attempt remains `started` and the caller
+   * records a failure + schedules a retry. Orphaned `stream_chunks` rows from the incomplete attempt are harmless —
+   * only chunks for `succeeded` attempts are ever read back via `getStoredStream`.
+   */
+  async handleRunAttemptStreamResult(
+    stepId: RunStepId,
+    stream: ReadableStream<Uint8Array>
+  ): Promise<ReadableStream<Uint8Array>> {
+    const [existing] = this.sql
+      .exec<RunStep_Row>(`SELECT * FROM steps WHERE id = ? AND type = 'run'`, stepId)
+      .toArray();
+    if (existing === undefined) {
+      throw new Error(`Run step '${stepId}' not found.`);
+    }
+
+    const [lastAttempt] = this.sql
+      .exec<StartedRunStepAttempt_Row>(
+        "SELECT * FROM run_step_attempts WHERE step_id = ? AND state = 'started' ORDER BY started_at DESC, id DESC LIMIT 1",
+        stepId
+      )
+      .toArray();
+    if (lastAttempt === undefined) {
+      throw new Error(`No in-flight attempt for run step '${stepId}'.`);
+    }
+
+    // Consume the stream chunk-by-chunk, persisting each to SQLite immediately.
+    // This avoids buffering the entire stream in memory.
+    const attemptId = lastAttempt.id;
+    const reader = stream.getReader();
+    let seq = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value.byteLength > 0) {
+          this.sql.exec("INSERT INTO stream_chunks (attempt_id, seq, data) VALUES (?, ?, ?)", attemptId, seq, value);
+          seq++;
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    // Only transition to `succeeded` after all chunks are durably stored.
+    this.sql.exec(
+      `UPDATE run_step_attempts SET state = 'succeeded', result_type = 'stream', ended_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER) WHERE id = ? AND state = 'started'`,
+      attemptId
+    );
+
+    return this.getStoredStream(attemptId);
+  }
+
+  /**
+   * Reconstructs a pull-based `ReadableStream` from chunks stored in `stream_chunks`. Memory-efficient: reads one chunk
+   * per `pull()` call, so only a single chunk is in flight at a time regardless of how many chunks were persisted.
+   */
+  getStoredStream(attemptId: string): ReadableStream<Uint8Array> {
+    let seq = 0;
+    const sql = this.sql;
+    return new ReadableStream<Uint8Array>({
+      pull(controller) {
+        const [row] = sql
+          .exec<{ data: ArrayBuffer }>(
+            "SELECT data FROM stream_chunks WHERE attempt_id = ? AND seq = ?",
+            attemptId,
+            seq
+          )
+          .toArray();
+        if (row) {
+          controller.enqueue(new Uint8Array(row.data));
+          seq++;
+        } else {
+          controller.close();
+        }
+      }
+    });
+  }
 }
 
 export type RunStepId = Brand<string, "RunStepId">;
@@ -889,7 +975,7 @@ export type RunStepAttempt = {
   | { state: "started" }
   | ({ state: "succeeded"; endedAt: Date } & (
       | { resultType: "json"; resultJson: string }
-      | { resultType: "none" }
+      | { resultType: "none" | "stream" }
     ))
   | { state: "failed"; errorMessage: string; errorName?: string; endedAt: Date; nextAttemptAt?: Date }
 );
@@ -957,6 +1043,7 @@ type TimedOutWaitStep = Extract<WaitStep, { state: "timed_out" }>;
  *
  * - `'json'` → `result_json` holds the raw JSON value (never NULL)
  * - `'none'` → callback returned `undefined`/`void`; no result data
+ * - `'stream'` → byte chunks stored in the `stream_chunks` table
  */
 type RunStepAttempt_Row = {
   id: string;
@@ -969,7 +1056,7 @@ type RunStepAttempt_Row = {
   | ({
       state: "succeeded";
       ended_at: number;
-    } & ({ result_type: "json"; result_json: string } | { result_type: "none" }))
+    } & ({ result_type: "json"; result_json: string } | { result_type: "none" | "stream" }))
   | {
       state: "failed";
       error_message: string;
