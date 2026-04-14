@@ -117,19 +117,61 @@ export abstract class WorkflowRuntime<
    * @returns An array containing the formatted steps for all steps in the
    * workflow.
    */
-  getSteps_experimental(): Step[] {
+  getSteps_experimental(): Array<(RunStep & { attempts: RunStepAttempt[] }) | SleepStep | WaitStep> {
     const steps = this.sql.exec<Step_Row>("SELECT * FROM steps ORDER BY created_at ASC").toArray();
-    return steps.map((step) => formatStep(step));
+    return steps.map((step) => {
+      if (step.type === "run") {
+        const attempts = this.sql
+          .exec<RunStepAttempt_Row>(
+            `SELECT * FROM run_step_attempts WHERE step_id = ? ORDER BY started_at ASC, id ASC`,
+            step.id
+          )
+          .toArray();
+        return {
+          ...formatRunStep(step),
+          attempts: attempts.map((attempt) => formatRunStepAttempt(attempt))
+        };
+      }
+      if (step.type === "sleep") {
+        return formatSleepStep(step);
+      } else if (step.type === "wait") {
+        if (step.state === "satisfied") {
+          return formatSatisfiedWaitStep(step, this.getInboundEventForWaitStep(step.id).payload);
+        } else if (step.state === "timed_out") {
+          return formatTimedOutWaitStep(step);
+        } else {
+          return formatWaitingWaitStep(step);
+        }
+      } else {
+        throw new Error("Unexpected step type. Expected 'run', 'sleep', or 'wait'.");
+      }
+    });
   }
 
   /**
-   * Retrieves all durable step events in the workflow, ordered by recording time.
+   * Loads the `inbound_events` row whose `claimed_by` is this wait step (`waitStepId`).
    *
-   * @returns Formatted `step_events` rows for the workflow instance.
+   * @throws If no such row exists (storage invariant broken or the step is not in a satisfied state with a claim).
    */
-  getStepEvents_experimental(): StepEvent[] {
-    const events = this.sql.exec<StepEventRow>("SELECT * FROM step_events ORDER BY recorded_at ASC");
-    return events.toArray().map((row) => formatStepEvent(row));
+  private getInboundEventForWaitStep<T extends Json | undefined = Json | undefined>(
+    stepId: WaitStepId
+  ): InboundEvent<T> {
+    const [row] = this.sql
+      .exec<ClaimedInboundEvent_Row>(`SELECT * FROM inbound_events WHERE claimed_by = ? LIMIT 1`, stepId)
+      .toArray();
+    if (row === undefined) {
+      throw new Error(
+        `Wait step '${stepId}' is satisfied in durable state but no inbound_events row is claimed by this step.`
+      );
+    }
+    return {
+      id: row.id,
+      eventName: row.event_name,
+      payload: (row.payload === null ? undefined : JSON.parse(row.payload)) as T,
+      createdAt: new Date(row.created_at),
+      claimedBy: row.claimed_by,
+      claimedAt: new Date(row.claimed_at)
+    };
   }
 
   /**
@@ -157,7 +199,9 @@ export abstract class WorkflowRuntime<
       return;
     }
 
-    const serializedPayload = payload !== undefined ? JSON.stringify(payload) : null;
+    // SQL NULL encodes `undefined` (no payload); raw JSON.stringify for everything else
+    // (including JSON null, which becomes the TEXT literal 'null').
+    const serializedPayload = payload === undefined ? null : JSON.stringify(payload);
 
     // If the workflow is paused, queue the event but do not satisfy any wait step or call run().
     // The event will be picked up when the workflow is resumed and execution hits getOrCreateWaitStep.
@@ -184,34 +228,24 @@ export abstract class WorkflowRuntime<
       .toArray();
 
     if (step !== undefined) {
-      this.sql.exec(
-        `UPDATE steps
+      this.ctx.storage.transactionSync(() => {
+        this.sql.exec(
+          `INSERT INTO inbound_events (event_name, payload, claimed_by, claimed_at)
+							 VALUES (?, ?, ?, CAST(unixepoch('subsecond') * 1000 AS INTEGER))`,
+          event,
+          serializedPayload,
+          step.id
+        );
+        this.sql.exec(
+          `UPDATE steps
 							 SET state = 'satisfied',
-									 payload = ?,
-									 resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER),
-									 timeout_at = NULL
+									 resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER)
 							 WHERE id = ?
 								 AND type = 'wait'
 								 AND state = 'waiting'`,
-        serializedPayload,
-        step.id
-      );
-
-      this.sql.exec(
-        `INSERT INTO step_events (step_id, type, payload)
-							 VALUES (?, ?, ?)`,
-        step.id,
-        "wait_satisfied",
-        serializedPayload
-      );
-
-      this.sql.exec(
-        `INSERT INTO inbound_events (event_name, payload, claimed_by, claimed_at)
-							 VALUES (?, ?, ?, CAST(unixepoch('subsecond') * 1000 AS INTEGER))`,
-        event,
-        serializedPayload,
-        step.id
-      );
+          step.id
+        );
+      });
 
       await this.run();
     } else {
@@ -280,7 +314,7 @@ export abstract class WorkflowRuntime<
 
     // Schedule another safety alarm if the run loop is still active.
     if (this.#isRunLoopActive) {
-      await this.ctx.storage.setAlarm(Date.now() + 30_000 * 60); // 30 minutes
+      await this.ctx.storage.setAlarm(Date.now() + 30 * 60 * 1000); // 30 minutes
     } else {
       await this.run();
     }
@@ -342,7 +376,6 @@ export abstract class WorkflowRuntime<
 
     if (this.#status !== "running") {
       this.#setStatus({ type: "running" });
-      this.#status = "running";
 
       if (this.onStatusChange_experimental !== undefined) {
         await this.onStatusChange_experimental("running");
@@ -352,7 +385,7 @@ export abstract class WorkflowRuntime<
     if (this.#isRunLoopActive) return;
 
     const requestId = crypto.randomUUID();
-    const context = new WorkflowRuntimeContext(this.ctx.storage, { requestId });
+    const context = new WorkflowRuntimeContext(this.ctx.storage);
 
     this.#isRunLoopActive = true;
 
@@ -381,7 +414,7 @@ export abstract class WorkflowRuntime<
             const version = this.#definitionVersion;
             if (version === undefined) {
               throw new Error(
-                "Workflow definition version has not been initialized. Call 'start()' before running the workflow."
+                "Workflow definition version has not been initialized. Call 'create()' before running the workflow."
               );
             }
 
@@ -428,7 +461,12 @@ export abstract class WorkflowRuntime<
             if (result.resume.type === "immediate") continue;
 
             // A 'suspended' resume hint indicates that the workflow should suspend itself and wait for the next alarm or inbound event to resume.
-            if (result.resume.type === "suspended") break;
+            if (result.resume.type === "suspended") {
+              if (result.resume.wakeAt !== undefined) {
+                await this.ctx.storage.setAlarm(result.resume.wakeAt);
+              }
+              break;
+            }
 
             break;
           } catch (error) {
@@ -476,201 +514,130 @@ export abstract class WorkflowRuntime<
 export class WorkflowRuntimeContext extends RpcTarget {
   private readonly storage: DurableObjectStorage;
   private readonly sql: SqlStorage;
-  private readonly requestId?: string;
   private static readonly BACKOFF_DELAYS = [250, 500, 1_000, 2_000, 4_000, 8_000, 10_000] as const;
 
   private static readonly DEFAULT_MAX_ATTEMPTS = 3;
 
-  constructor(storage: DurableObjectStorage, options?: { requestId?: string }) {
+  constructor(storage: DurableObjectStorage) {
     super();
     this.storage = storage;
     this.sql = storage.sql;
-    this.requestId = options?.requestId;
-  }
-
-  public async getOrCreateStep(
-    id: RunStepId,
-    options: { type: "run"; maxAttempts?: number | null; parentStepId: RunStepId | null }
-  ): Promise<RunStep>;
-  public async getOrCreateStep(
-    id: SleepStepId,
-    options: { type: "sleep"; wakeAt: Date; parentStepId: RunStepId | null }
-  ): Promise<SleepStep>;
-  public async getOrCreateStep(
-    id: WaitStepId,
-    options: { type: "wait"; eventName: string; timeoutAt?: Date; parentStepId: RunStepId | null }
-  ): Promise<WaitStep>;
-  public async getOrCreateStep(
-    id: RunStepId | SleepStepId | WaitStepId,
-    options:
-      | { type: "run"; maxAttempts?: number | null; parentStepId: RunStepId | null }
-      | { type: "sleep"; wakeAt: Date; parentStepId: RunStepId | null }
-      | { type: "wait"; eventName: string; timeoutAt?: Date; parentStepId: RunStepId | null }
-  ): Promise<Step> {
-    try {
-      if (options.type === "run") {
-        return await this.getOrCreateRunStep(id as RunStepId, {
-          maxAttempts: options?.maxAttempts,
-          parentStepId: options.parentStepId
-        });
-      } else if (options.type === "sleep") {
-        return await this.getOrCreateSleepStep(id as SleepStepId, {
-          wakeAt: options.wakeAt,
-          parentStepId: options.parentStepId
-        });
-      } else {
-        return await this.getOrCreateWaitStep(id as WaitStepId, {
-          eventName: options.eventName,
-          timeoutAt: options.timeoutAt,
-          parentStepId: options.parentStepId
-        });
-      }
-    } catch (error) {
-      console.error(error instanceof Error ? error : new Error(String(error)), { requestId: this.requestId });
-      if (error instanceof Error && isSqliteInvariantViolation(error.message)) {
-        throw new WorkflowInvariantError(error.message);
-      }
-
-      // All other errors are considered to be infrastructure/critical errors and may cause the DO to be reset
-      // The following are examples of such errors:
-      // 'SQLITE_FULL',      // Database or disk is full
-      // 'SQLITE_IOERR',     // I/O error
-      // 'SQLITE_BUSY',      // Database is locked
-      // 'SQLITE_NOMEM',     // Out of memory
-      // 'SQLITE_INTERRUPT', // Operation interrupted
-      // 'SQLITE_CORRUPT',   // Database file is corrupted
-      // 'SQLITE_CANTOPEN',  // Cannot open database file
-      throw error;
-    }
   }
 
   /**
-   * True if this run step has at least one **direct** child that still **explains** a parent left in `running`:
-   * typically `run` in `running` or `pending`, `sleep`/`wait` in `waiting`, or a successful-but-not-failed child row
-   * (`succeeded` run, `satisfied` wait, `elapsed` sleep) while the parent has not yet recorded its own outcome.
+   * Loads the `inbound_events` row whose `claimed_by` is this wait step (`waitStepId`).
    *
-   * Excludes only terminal **failure** child states (`failed`, `timed_out`).
+   * @throws If no such row exists (storage invariant broken or the step is not in a satisfied state with a claim).
    */
-  public async hasRunningOrWaitingChildSteps(stepId: RunStepId): Promise<boolean> {
-    const rows = this.sql
-      .exec<{ x: number }>(
-        `SELECT 1 AS x FROM steps
-         WHERE parent_step_id = ?
-           AND state NOT IN ('failed', 'timed_out')
-         LIMIT 1`,
-        stepId
-      )
+  private getInboundEventForWaitStep<T extends Json | undefined>(stepId: WaitStepId): InboundEvent<T> {
+    const [row] = this.sql
+      .exec<ClaimedInboundEvent_Row>(`SELECT * FROM inbound_events WHERE claimed_by = ? LIMIT 1`, stepId)
       .toArray();
-    return rows.length > 0;
+    if (row === undefined) {
+      throw new Error(
+        `Wait step '${stepId}' is satisfied in durable state but no inbound_events row is claimed by this step.`
+      );
+    }
+    return {
+      id: row.id,
+      eventName: row.event_name,
+      payload: (row.payload === null ? undefined : JSON.parse(row.payload)) as T,
+      createdAt: new Date(row.created_at),
+      claimedBy: row.claimed_by,
+      claimedAt: new Date(row.claimed_at)
+    };
   }
 
-  private async getOrCreateRunStep(
+  getOrCreateRunStep(
     id: RunStepId,
-    options: { maxAttempts?: number | null; parentStepId: RunStepId | null }
-  ): Promise<RunStep> {
-    const maxAttempts =
-      options.maxAttempts === undefined ? WorkflowRuntimeContext.DEFAULT_MAX_ATTEMPTS : options.maxAttempts;
-    return await this.storage.transaction(async (transaction) => {
-      const [existing] = this.sql.exec<RunStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'run'", id).toArray();
-      // If the step does not exist, we create it and mark the attempt as 'pending'.
-      if (existing === undefined) {
-        const inserted = this.sql
-          .exec<RunStep_Row>(
-            `INSERT INTO steps (id, type, state, attempt_count, max_attempts, next_attempt_at, parent_step_id) VALUES (?, 'run', 'pending', 0, ?, CAST(unixepoch('subsecond') * 1000 AS INTEGER), ?) RETURNING *`,
-            id,
-            maxAttempts,
-            options.parentStepId
-          )
-          .one();
-
-        return formatStep(inserted);
-      } else {
-        // If the step exists and is in 'pending' state, we update the alarm to wake at the correct time.
-        if (existing.state === "pending" && Date.now() < existing.next_attempt_at) {
-          await transaction.setAlarm(existing.next_attempt_at);
-        }
-        return formatStep(existing);
-      }
-    });
-  }
-
-  private async getOrCreateSleepStep(
-    id: SleepStepId,
-    options: { wakeAt: Date; parentStepId: RunStepId | null }
-  ): Promise<SleepStep> {
-    return await this.storage.transaction(async (transaction) => {
-      const [existing] = this.sql
-        .exec<SleepStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'sleep'", id)
-        .toArray();
-      if (existing !== undefined) {
-        // If the step exists and is in 'waiting' state, we update the alarm to wake at the correct time.
-        if (existing.state === "waiting" && Date.now() < existing.wake_at) {
-          await transaction.setAlarm(existing.wake_at);
-        }
-        return formatStep(existing);
-      }
-
-      // If the step does not exist, we create it, set it to 'waiting' state and set the alarm to wake at the correct time.
-      const wakeAt = options.wakeAt.getTime();
+    options: {
+      maxAttempts?: number | null;
+      parentStepId: RunStepId | null;
+    }
+  ): RunStep & { attempts: RunStepAttempt[] } {
+    const [existing] = this.sql.exec<RunStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'run'", id).toArray();
+    if (existing === undefined) {
       const inserted = this.sql
-        .exec<SleepStep_Row>(
-          `INSERT INTO steps (id, type, state, wake_at, parent_step_id) VALUES (?, 'sleep', 'waiting', ?, ?) RETURNING *`,
+        .exec<RunStep_Row>(
+          `INSERT INTO steps (id, type, parent_step_id, max_attempts) VALUES (?, 'run', ?, ?) RETURNING *`,
           id,
-          wakeAt,
-          options.parentStepId
+          options.parentStepId,
+          options.maxAttempts ?? WorkflowRuntimeContext.DEFAULT_MAX_ATTEMPTS
         )
         .one();
-      this.sql.exec("INSERT INTO step_events (step_id, type, wake_at) VALUES (?, ?, ?)", id, "sleep_waiting", wakeAt);
-      await transaction.setAlarm(wakeAt);
-      return formatStep(inserted);
-    });
+      return { ...formatRunStep(inserted), attempts: [] };
+    } else {
+      const attempts = this.sql
+        .exec<RunStepAttempt_Row>(
+          `SELECT * FROM run_step_attempts WHERE step_id = ? ORDER BY started_at ASC, id ASC`,
+          id
+        )
+        .toArray();
+
+      return {
+        ...formatRunStep(existing),
+        attempts: attempts.map((attempt) => formatRunStepAttempt(attempt))
+      };
+    }
   }
 
-  private async getOrCreateWaitStep(
+  getOrCreateSleepStep(id: SleepStepId, options: { wakeAt: Date; parentStepId: RunStepId | null }): SleepStep {
+    const [existing] = this.sql
+      .exec<SleepStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'sleep'", id)
+      .toArray();
+    if (existing !== undefined) {
+      return formatSleepStep(existing);
+    }
+
+    const wakeAt = options.wakeAt.getTime();
+    const inserted = this.sql
+      .exec<SleepStep_Row>(
+        `INSERT INTO steps (id, type, state, target_wake_at, parent_step_id) VALUES (?, 'sleep', 'waiting', ?, ?) RETURNING *`,
+        id,
+        wakeAt,
+        options.parentStepId
+      )
+      .one();
+    return formatSleepStep(inserted);
+  }
+
+  getOrCreateWaitStep<T extends Json | undefined>(
     id: WaitStepId,
     options: { eventName: string; timeoutAt?: Date; parentStepId: RunStepId | null }
-  ): Promise<WaitStep> {
-    return await this.storage.transaction(async (transaction) => {
-      const [existing] = this.sql
-        .exec<WaitStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'wait'", id)
-        .toArray();
-      // If the step exists and isn't in 'waiting' state (i.e. in terminal state of 'satisfied' or 'timed_out'), we return the step as is as no further action is needed.
-      if (existing !== undefined && existing.state !== "waiting") {
-        return formatStep(existing);
+  ): WaitStep<T> {
+    const [existing] = this.sql.exec<WaitStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'wait'", id).toArray();
+    // If the step exists and isn't in 'waiting' state (i.e. in terminal state of 'satisfied' or 'timed_out'), we return the step as is as no further action is needed.
+    if (existing !== undefined && existing.state !== "waiting") {
+      if (existing.state === "satisfied") {
+        return formatSatisfiedWaitStep<T>(existing, this.getInboundEventForWaitStep<T>(existing.id).payload);
+      } else if (existing.state === "timed_out") {
+        return formatTimedOutWaitStep(existing);
       }
+    }
 
-      let waiting: Extract<WaitStep_Row, { state: "waiting" }>;
-      if (existing !== undefined) {
-        waiting = existing;
-      } else {
-        waiting = this.sql
-          .exec<Extract<WaitStep_Row, { state: "waiting" }>>(
-            `
+    let waiting: Extract<WaitStep_Row, { state: "waiting" }>;
+    if (existing !== undefined) {
+      waiting = existing;
+    } else {
+      waiting = this.sql
+        .exec<Extract<WaitStep_Row, { state: "waiting" }>>(
+          `
 						INSERT INTO steps (id, type, state, event_name, timeout_at, parent_step_id)
 						VALUES (?, 'wait', 'waiting', ?, ?, ?)
 						RETURNING *
 						`,
-            id,
-            options.eventName,
-            options.timeoutAt !== undefined ? options.timeoutAt.getTime() : null,
-            options.parentStepId
-          )
-          .one();
-        this.sql.exec(
-          `INSERT INTO step_events (step_id, type, event_name, timeout_at) VALUES (?, ?, ?, ?)`,
           id,
-          "wait_waiting",
           options.eventName,
-          options.timeoutAt !== undefined ? options.timeoutAt.getTime() : null
-        );
-      }
+          options.timeoutAt !== undefined ? options.timeoutAt.getTime() : null,
+          options.parentStepId
+        )
+        .one();
+    }
 
-      const timeoutAt = waiting.timeout_at;
-
-      // Attempt to claim any inbound event that is not claimed yet for the given event name.
-      const [event] = this.sql
-        .exec<{ id: string; payload: string }>(
-          `
+    // Attempt to claim any inbound event that is not claimed yet for the given event name.
+    const [claimed] = this.sql
+      .exec<{ id: string; payload: string | null }>(
+        `
 	UPDATE inbound_events
 		 SET claimed_by = ?,
 				 claimed_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER)
@@ -685,280 +652,228 @@ export class WorkflowRuntimeContext extends RpcTarget {
 		 AND claimed_by IS NULL
 	RETURNING id, payload
 	`,
-          id,
-          options.eventName
-        )
-        .toArray();
+        id,
+        options.eventName
+      )
+      .toArray();
 
-      // If a queued inbound event was found, we mark the step as 'satisfied' and return the satisfied step.
-      if (event !== undefined) {
-        const satisfied = this.sql
-          .exec<WaitStep_Row>(
-            `
+    if (claimed !== undefined) {
+      const satisfied = this.sql
+        .exec<SatisfiedWaitStep_Row>(
+          `
 			UPDATE steps
 				 SET state = 'satisfied',
-						 payload = ?,
-						 resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER),
-						 timeout_at = NULL
+						 resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER)
 			 WHERE id = ?
 				 AND type = 'wait'
 				 AND state = 'waiting'
 			RETURNING *
 			`,
-            event.payload,
-            id
-          )
-          .one();
+          id
+        )
+        .one();
+      return formatSatisfiedWaitStep<T>(satisfied, claimed.payload === null ? undefined : JSON.parse(claimed.payload));
+    }
 
-        this.sql.exec(
-          `
-		INSERT INTO step_events (step_id, type, payload)
-		VALUES (?, ?, ?)
-		`,
-          id,
-          "wait_satisfied",
-          event.payload
-        );
-
-        return formatStep(satisfied);
-      }
-      // If no queued inbound event was found, we return the step as is.
-      else {
-        if (timeoutAt !== null && Date.now() < timeoutAt) {
-          await transaction.setAlarm(timeoutAt);
-        } else {
-          await transaction.deleteAlarm();
-        }
-        return formatStep(waiting);
-      }
-    });
+    return formatWaitingWaitStep(waiting);
   }
-  async handleRunAttemptEvent(
-    id: RunStepId,
-    event:
-      | { type: "running"; attemptCount: number }
-      | { type: "succeeded"; attemptCount: number; result: string }
-      | {
-          type: "failed";
-          attemptCount: number;
-          errorMessage: string;
-          errorName?: string;
-          isNonRetryableStepError?: boolean;
-        }
-  ): Promise<void> {
-    try {
-      await this.storage.transaction(async (transaction) => {
-        const [existing] = this.sql
-          .exec<RunStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'run'", id)
-          .toArray();
-        if (existing === undefined) {
-          throw new WorkflowInvariantError(`Step '${id}' of type 'run' not found.`);
-        }
 
-        const attemptCount = event.attemptCount;
+  /**
+   * True if this run step has at least one **direct** child that is still in progress.
+   */
+  hasInProgressChildSteps(stepId: RunStepId): boolean {
+    const rows = this.sql
+      .exec<{ x: number }>(
+        `SELECT 1 AS x FROM steps c
+         WHERE c.parent_step_id = ?
+           AND (
+             (c.type = 'sleep' AND c.state IN ('waiting', 'elapsed'))
+             OR (c.type = 'wait' AND c.state IN ('waiting', 'satisfied'))
+             OR (
+               c.type = 'run'
+               AND NOT EXISTS (
+                 SELECT 1
+                 FROM run_step_attempts a
+                 WHERE a.step_id = c.id
+                   AND a.state = 'failed'
+                   AND a.next_attempt_at IS NULL
+                   AND a.id = (
+                     SELECT a2.id
+                     FROM run_step_attempts a2
+                     WHERE a2.step_id = c.id
+                     ORDER BY a2.started_at DESC, a2.id DESC
+                     LIMIT 1
+                   )
+               )
+             )
+           )
+         LIMIT 1`,
+        stepId
+      )
+      .toArray();
+    return rows.length > 0;
+  }
 
-        if (event.type === "running") {
-          if (existing.state !== "pending") {
-            throw new WorkflowInvariantError(
-              `Unexpected state for run step '${id}'. Expected 'pending' but got ${existing.state}.`
-            );
-          }
-          if (existing.next_attempt_at !== null && existing.next_attempt_at > Date.now()) {
-            throw new WorkflowInvariantError(
-              `Unexpected next attempt at for run step '${id}'. Expected a NULL value or a value that is in the past but got ${new Date(existing.next_attempt_at).toISOString()}.`
-            );
-          }
-          if (existing.attempt_count !== attemptCount - 1) {
-            throw new WorkflowInvariantError(
-              `Unexpected attempt count for run step '${id}'. Expected ${attemptCount - 1} but got ${existing.attempt_count}.`
-            );
-          }
-          // Update the step to the 'running' state and insert an `attempt_started` step_events row.
-          this.sql.exec(
-            `UPDATE steps SET state = 'running', attempt_count = ?, next_attempt_at = NULL WHERE id = ?`,
-            attemptCount,
-            id
-          );
-          this.sql.exec(
-            "INSERT INTO step_events (step_id, type, attempt_number) VALUES (?, ?, ?)",
-            id,
-            "attempt_started",
-            attemptCount
-          );
-        } else if (event.type === "succeeded") {
-          if (existing.state !== "running") {
-            throw new WorkflowInvariantError(
-              `Unexpected state for run step '${id}'. Expected 'running' but got ${existing.state}.`
-            );
-          }
-          if (existing.attempt_count !== attemptCount) {
-            throw new WorkflowInvariantError(
-              `Unexpected attempt count for run step '${id}'. Expected ${attemptCount} but got ${existing.attempt_count}.`
-            );
-          }
-          // Update the step to the 'succeeded' state and insert an `attempt_succeeded` step_events row.
-          this.sql.exec(
-            `UPDATE steps SET state = 'succeeded', result = ?, resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER) WHERE id = ?`,
-            event.result,
-            id
-          );
-          this.sql.exec(
-            "INSERT INTO step_events (step_id, type, attempt_number, result) VALUES (?, ?, ?, ?)",
-            id,
-            "attempt_succeeded",
-            attemptCount,
-            event.result
-          );
-        } else if (event.type === "failed") {
-          if (existing.state !== "running") {
-            throw new WorkflowInvariantError(
-              `Unexpected state for run step '${id}'. Expected 'running' but got ${existing.state}.`
-            );
-          }
+  handleRunAttemptStarted(stepId: RunStepId): StartedRunStepAttempt {
+    // If a run step with the given id does not exist, we throw a 'WorkflowInvariantError' indicating that the step was not found.
+    const [existing] = this.sql
+      .exec<RunStep_Row>(`SELECT * FROM steps WHERE id = ? AND type = 'run'`, stepId)
+      .toArray();
+    if (existing === undefined) {
+      throw new Error(`Run step '${stepId}' not found.`);
+    }
 
-          if (existing.attempt_count !== attemptCount) {
-            throw new WorkflowInvariantError(
-              `Unexpected attempt count for run step '${id}'. Expected ${attemptCount} but got ${existing.attempt_count}.`
-            );
-          }
+    // Get the last attempt for the step.
+    const [lastAttempt] = this.sql
+      .exec<RunStepAttempt_Row>(
+        "SELECT * FROM run_step_attempts WHERE step_id = ? ORDER BY started_at DESC, id DESC",
+        stepId
+      )
+      .toArray();
 
-          // If the step has reached the maximum number of attempts, we mark the step as 'failed'
-          if (
-            (existing.max_attempts != null && existing.attempt_count >= existing.max_attempts) ||
-            event.isNonRetryableStepError
-          ) {
-            this.sql.exec(
-              `UPDATE steps SET state = 'failed', error_message = ?, error_name = ?, resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER) WHERE id = ?`,
-              event.errorMessage,
-              event.errorName ?? null,
-              id
-            );
+    // If the last attempt has been started, we throw a 'WorkflowInvariantError' indicating that the attempt is already in progress.
+    if (lastAttempt !== undefined && lastAttempt.state === "started") {
+      throw new Error(`Attempt '${lastAttempt.id}' for run step '${stepId}' is already in progress.`);
+    }
 
-            // Insert an `attempt_failed` step_events row
-            this.sql.exec(
-              "INSERT INTO step_events (step_id, type, attempt_number, error_message, error_name) VALUES (?, ?, ?, ?, ?)",
-              id,
-              "attempt_failed",
-              attemptCount,
-              event.errorMessage,
-              event.errorName ?? null
-            );
-          }
-          // Otherwise (if the step hasn't reached the maximum number of attempts), we mark the step as 'pending'
-          // and update 'next_attempt_at' to the next backoff time and set the alarm to wake up at the same time.
-          else {
-            const backoff =
-              WorkflowRuntimeContext.BACKOFF_DELAYS[attemptCount - 1] ??
-              (WorkflowRuntimeContext.BACKOFF_DELAYS[WorkflowRuntimeContext.BACKOFF_DELAYS.length - 1] as number);
-            const nextAttemptAt = Date.now() + backoff;
-            this.sql.exec(`UPDATE steps SET state = 'pending', next_attempt_at = ? WHERE id = ?`, nextAttemptAt, id);
-            this.sql.exec(
-              "INSERT INTO step_events (step_id, type, attempt_number, error_message, error_name, next_attempt_at) VALUES (?, ?, ?, ?, ?, ?)",
-              id,
-              "attempt_failed",
-              attemptCount,
-              event.errorMessage,
-              event.errorName ?? null,
-              nextAttemptAt
-            );
-            await transaction.setAlarm(nextAttemptAt);
-          }
-        }
-      });
-    } catch (error) {
-      console.error(error instanceof Error ? error : new Error(String(error)), { requestId: this.requestId });
-      if (error instanceof Error && isSqliteInvariantViolation(error.message)) {
-        throw new WorkflowInvariantError(error.message);
-      }
-      throw error;
+    // Insert a new attempt for the step and return the new attempt
+    const attempt = this.sql
+      .exec<StartedRunStepAttempt_Row>(
+        `INSERT INTO run_step_attempts (step_id, state) VALUES (?, 'started') RETURNING *`,
+        stepId
+      )
+      .one();
+    return formatRunStepAttempt(attempt);
+  }
+
+  handleRunAttemptFailed(
+    stepId: RunStepId,
+    result: {
+      errorMessage: string;
+      errorName?: string;
+      isNonRetryableStepError?: boolean;
+    }
+  ): FailedRunStepAttempt {
+    // If a run step with the given id does not exist, we throw a 'WorkflowInvariantError' indicating that the step was not found.
+    const [existing] = this.sql
+      .exec<RunStep_Row>(`SELECT * FROM steps WHERE id = ? AND type = 'run'`, stepId)
+      .toArray();
+    if (existing === undefined) {
+      throw new Error(`Run step '${stepId}' not found.`);
+    }
+
+    // Get the last attempt for the step.
+    const attempts = this.sql
+      .exec<RunStepAttempt_Row>("SELECT * FROM run_step_attempts WHERE step_id = ? ORDER BY started_at ASC", stepId)
+      .toArray();
+
+    const lastAttempt = attempts[attempts.length - 1];
+    if (lastAttempt === undefined) {
+      throw new Error(`No attempt in progress for run step '${stepId}'.`);
+    }
+
+    if (result.isNonRetryableStepError || attempts.length === existing.max_attempts) {
+      const updated = this.sql
+        .exec<Extract<RunStepAttempt_Row, { state: "failed" }>>(
+          `UPDATE run_step_attempts SET state = 'failed', ended_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER), error_message = ?, error_name = ?, next_attempt_at = NULL WHERE id = ? AND state = 'started' RETURNING *`,
+          result.errorMessage,
+          result.errorName ?? null,
+          lastAttempt.id
+        )
+        .one();
+      return formatRunStepAttempt(updated);
+    } else {
+      const backoff =
+        WorkflowRuntimeContext.BACKOFF_DELAYS[attempts.length - 1] ??
+        (WorkflowRuntimeContext.BACKOFF_DELAYS[WorkflowRuntimeContext.BACKOFF_DELAYS.length - 1] as number);
+      const nextAttemptAt = Date.now() + backoff;
+
+      const updated = this.sql
+        .exec<Extract<RunStepAttempt_Row, { state: "failed" }>>(
+          `UPDATE run_step_attempts SET state = 'failed', ended_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER), error_message = ?, error_name = ?, next_attempt_at = ? WHERE id = ? AND state = 'started' RETURNING *`,
+          result.errorMessage,
+          result.errorName ?? null,
+          nextAttemptAt,
+          lastAttempt.id
+        )
+        .one();
+      return formatRunStepAttempt(updated);
     }
   }
 
-  handleSleepStepEvent(id: SleepStepId, event: { type: "elapsed" }): void {
-    try {
+  /**
+   * Marks the in-flight attempt as succeeded.
+   *
+   * @param resultJson - Raw JSON string for the result value (`null` when the callback returned `undefined`). The
+   *   `result_type` discriminator is derived: `null` → `'none'`, non-null → `'json'`.
+   */
+  handleRunAttemptSucceeded(stepId: RunStepId, resultJson: string | null): SucceededRunStepAttempt {
+    const [existing] = this.sql
+      .exec<RunStep_Row>(`SELECT * FROM steps WHERE id = ? AND type = 'run'`, stepId)
+      .toArray();
+    if (existing === undefined) {
+      throw new Error(`Run step '${stepId}' not found.`);
+    }
+
+    const attempts = this.sql
+      .exec<RunStepAttempt_Row>("SELECT * FROM run_step_attempts WHERE step_id = ? ORDER BY started_at ASC", stepId)
+      .toArray();
+
+    const lastAttempt = attempts[attempts.length - 1];
+    if (lastAttempt === undefined || lastAttempt?.state !== "started") {
+      throw new Error(`No attempt in progress for run step '${stepId}'.`);
+    }
+
+    const resultType = resultJson === null ? "none" : "json";
+    const updated = this.sql
+      .exec<SucceededRunStepAttempt_Row>(
+        `UPDATE run_step_attempts SET state = 'succeeded', ended_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER), result_type = ?, result_json = ? WHERE id = ? AND state = 'started' RETURNING *`,
+        resultType,
+        resultJson,
+        lastAttempt.id
+      )
+      .one();
+    return formatRunStepAttempt(updated);
+  }
+
+  handleSleepStepElapsed(id: SleepStepId): void {
+    const [existing] = this.sql
+      .exec<SleepStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'sleep'", id)
+      .toArray();
+    if (existing === undefined) {
+      throw new Error(`Step '${id}' of type 'sleep' not found.`);
+    }
+
+    if (existing.state !== "waiting") {
+      throw new Error(`Unexpected state for sleep step '${id}'. Expected 'waiting' but got ${existing.state}.`);
+    }
+    this.sql.exec(
+      `UPDATE steps SET state = 'elapsed', resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER) WHERE id = ?`,
+      id
+    );
+  }
+
+  handleWaitStepTimedOut(id: WaitStepId): void {
+    this.storage.transactionSync(() => {
       const [existing] = this.sql
-        .exec<SleepStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'sleep'", id)
+        .exec<WaitStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'wait'", id)
         .toArray();
       if (existing === undefined) {
-        throw new WorkflowInvariantError(`Step '${id}' of type 'sleep' not found.`);
+        throw new Error(`Step '${id}' of type 'wait' not found.`);
       }
-
-      if (event.type === "elapsed") {
-        // Update the step to the 'elapsed' state and insert a `sleep_elapsed` step_events row.
-        if (existing.state !== "waiting") {
-          throw new WorkflowInvariantError(
-            `Unexpected state for sleep step '${id}'. Expected 'waiting' but got ${existing.state}.`
-          );
-        }
-        this.sql.exec(
-          `UPDATE steps SET state = 'elapsed', resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER), wake_at = NULL WHERE id = ?`,
-          id
+      if (existing.state !== "waiting") {
+        throw new Error(`Unexpected state for wait step '${id}'. Expected 'waiting' but got ${existing.state}.`);
+      }
+      if (existing.timeout_at !== null && existing.timeout_at > Date.now()) {
+        throw new Error(
+          `Unexpected timeout at for wait step '${id}'. Expected a NULL value or a value that is in the past but got ${new Date(existing.timeout_at).toISOString()}.`
         );
-        this.sql.exec("INSERT INTO step_events (step_id, type) VALUES (?, ?)", id, "sleep_elapsed");
       }
-    } catch (error) {
-      console.error(error instanceof Error ? error : new Error(String(error)), { requestId: this.requestId });
-      if (error instanceof Error && isSqliteInvariantViolation(error.message)) {
-        throw new WorkflowInvariantError(error.message);
-      }
-      throw error;
-    }
-  }
-
-  handleWaitStepEvent(id: WaitStepId, event: { type: "timed_out" }): void {
-    try {
-      this.storage.transactionSync(() => {
-        const [existing] = this.sql
-          .exec<WaitStep_Row>("SELECT * FROM steps WHERE id = ? AND type = 'wait'", id)
-          .toArray();
-        if (existing === undefined) {
-          throw new WorkflowInvariantError(`Step '${id}' of type 'wait' not found.`);
-        }
-        if (existing.state !== "waiting") {
-          throw new WorkflowInvariantError(
-            `Unexpected state for wait step '${id}'. Expected 'waiting' but got ${existing.state}.`
-          );
-        }
-        // If the step has a timeout and the timeout has not been reached, we throw an error to explain the state mismatch.
-        if (existing.timeout_at !== null && existing.timeout_at > Date.now()) {
-          throw new WorkflowInvariantError(
-            `Unexpected timeout at for wait step '${id}'. Expected a NULL value or a value that is in the past but got ${new Date(existing.timeout_at).toISOString()}.`
-          );
-        }
-        // If the step has timed out, we mark the step as 'timed_out' and insert a `wait_timed_out` step_events row.
-        if (event.type === "timed_out") {
-          this.sql.exec(
-            "UPDATE steps SET state = 'timed_out', resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER), timeout_at = NULL WHERE id = ?",
-            id
-          );
-          this.sql.exec("INSERT INTO step_events (step_id, type) VALUES (?, ?)", id, "wait_timed_out");
-        }
-      });
-    } catch (error) {
-      console.error(error instanceof Error ? error : new Error(String(error)), { requestId: this.requestId });
-      if (error instanceof Error && isSqliteInvariantViolation(error.message)) {
-        throw new WorkflowInvariantError(error.message);
-      }
-      throw error;
-    }
-  }
-}
-
-function isSqliteInvariantViolation(message: string): boolean {
-  return (
-    message.includes("SQLITE_CONSTRAINT") || // Constraint violation (FK, UNIQUE, CHECK, NOT NULL)
-    message.includes("SQLITE_MISMATCH") || // Data type mismatch
-    message.includes("SQLITE_ERROR") || // Generic SQL error (syntax, etc.)
-    message.includes("SQLITE_RANGE") || // Parameter index out of range
-    message.includes("SQLITE_AUTH") || // Authorization denied (e.g., accessing _cf_ tables)
-    message.includes("SQLITE_TOOBIG") // String or BLOB too large
-  );
-}
-
-class WorkflowInvariantError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "WorkflowInvariantError";
+      this.sql.exec(
+        "UPDATE steps SET state = 'timed_out', resolved_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER) WHERE id = ?",
+        id
+      );
+    });
   }
 }
 
@@ -966,33 +881,30 @@ export type RunStepId = Brand<string, "RunStepId">;
 export type SleepStepId = Brand<string, "SleepStepId">;
 export type WaitStepId = Brand<string, "WaitStepId">;
 
-type RunStep = {
+export type RunStepAttempt = {
+  id: string;
+  stepId: RunStepId;
+  startedAt: Date;
+} & (
+  | { state: "started" }
+  | ({ state: "succeeded"; endedAt: Date } & (
+      | { resultType: "json"; resultJson: string }
+      | { resultType: "none" }
+    ))
+  | { state: "failed"; errorMessage: string; errorName?: string; endedAt: Date; nextAttemptAt?: Date }
+);
+
+export type StartedRunStepAttempt = Extract<RunStepAttempt, { state: "started" }>;
+export type SucceededRunStepAttempt = Extract<RunStepAttempt, { state: "succeeded" }>;
+export type FailedRunStepAttempt = Extract<RunStepAttempt, { state: "failed" }>;
+
+export type RunStep = {
   type: "run";
   id: RunStepId;
   createdAt: Date;
-  attemptCount: number;
   maxAttempts: number | null;
   parentStepId: RunStepId | null;
-} & (
-  | {
-      state: "pending";
-      nextAttemptAt: Date;
-    }
-  | {
-      state: "running";
-    }
-  | {
-      state: "succeeded";
-      result: string;
-      resolvedAt: Date;
-    }
-  | {
-      state: "failed";
-      errorMessage: string;
-      errorName?: string;
-      resolvedAt: Date;
-    }
-);
+};
 
 type SleepStep = {
   type: "sleep";
@@ -1010,7 +922,7 @@ type SleepStep = {
     }
 );
 
-type WaitStep = {
+type WaitStep<T extends Json | undefined = Json | undefined> = {
   type: "wait";
   id: WaitStepId;
   createdAt: Date;
@@ -1023,254 +935,169 @@ type WaitStep = {
     }
   | {
       state: "satisfied";
-      payload: string;
+      payload: T;
       resolvedAt: Date;
+      timeoutAt?: Date;
     }
   | {
       state: "timed_out";
       resolvedAt: Date;
+      timeoutAt: Date;
     }
 );
 
-type Step = RunStep | SleepStep | WaitStep;
+type WaitingWaitStep = Extract<WaitStep, { state: "waiting" }>;
+type SatisfiedWaitStep<T extends Json | undefined> = Extract<WaitStep<T>, { state: "satisfied" }>;
+type TimedOutWaitStep = Extract<WaitStep, { state: "timed_out" }>;
 
-function formatStep(step: RunStep_Row): RunStep;
-function formatStep(step: SleepStep_Row): SleepStep;
-function formatStep(step: WaitStep_Row): WaitStep;
-function formatStep(step: Step_Row): Step;
-function formatStep(step: Step_Row): Step {
-  switch (step.type) {
-    case "run": {
-      switch (step.state) {
-        case "pending":
-          return {
-            type: "run",
-            id: step.id,
-            state: "pending",
-            nextAttemptAt: new Date(step.next_attempt_at),
-            createdAt: new Date(step.created_at),
-            attemptCount: step.attempt_count,
-            maxAttempts: step.max_attempts,
-            parentStepId: step.parent_step_id
-          } satisfies RunStep;
-        case "running":
-          return {
-            type: "run",
-            id: step.id,
-            state: "running",
-            createdAt: new Date(step.created_at),
-            attemptCount: step.attempt_count,
-            maxAttempts: step.max_attempts,
-            parentStepId: step.parent_step_id
-          } satisfies RunStep;
-        case "succeeded":
-          return {
-            type: "run",
-            id: step.id,
-            state: "succeeded",
-            result: step.result,
-            resolvedAt: new Date(step.resolved_at),
-            createdAt: new Date(step.created_at),
-            attemptCount: step.attempt_count,
-            maxAttempts: step.max_attempts,
-            parentStepId: step.parent_step_id
-          } satisfies RunStep;
-        case "failed":
-          return {
-            type: "run",
-            id: step.id,
-            state: "failed",
-            errorMessage: step.error_message,
-            errorName: step.error_name ?? undefined,
-            resolvedAt: new Date(step.resolved_at),
-            createdAt: new Date(step.created_at),
-            attemptCount: step.attempt_count,
-            maxAttempts: step.max_attempts,
-            parentStepId: step.parent_step_id
-          } satisfies RunStep;
-        default:
-          throw new Error("Unexpected step state");
-      }
+/**
+ * SQLite row shape for `run_step_attempts`.
+ *
+ * Succeeded attempts use a `result_type` discriminator:
+ *
+ * - `'json'` → `result_json` holds the raw JSON value (never NULL)
+ * - `'none'` → callback returned `undefined`/`void`; no result data
+ */
+type RunStepAttempt_Row = {
+  id: string;
+  step_id: RunStepId;
+  started_at: number;
+} & (
+  | {
+      state: "started";
     }
-    case "sleep":
-      switch (step.state) {
-        case "waiting":
-          return {
-            type: "sleep",
-            id: step.id,
-            state: "waiting",
-            wakeAt: new Date(step.wake_at),
-            createdAt: new Date(step.created_at),
-            parentStepId: step.parent_step_id
-          } satisfies SleepStep;
-        case "elapsed":
-          return {
-            type: "sleep",
-            id: step.id,
-            state: "elapsed",
-            resolvedAt: new Date(step.resolved_at),
-            createdAt: new Date(step.created_at),
-            parentStepId: step.parent_step_id
-          } satisfies SleepStep;
-        default:
-          throw new Error("Unexpected step state");
+  | ({
+      state: "succeeded";
+      ended_at: number;
+    } & ({ result_type: "json"; result_json: string } | { result_type: "none" }))
+  | {
+      state: "failed";
+      error_message: string;
+      error_name: string | null;
+      ended_at: number;
+      next_attempt_at: number | null;
+    }
+);
+
+type StartedRunStepAttempt_Row = Extract<RunStepAttempt_Row, { state: "started" }>;
+type SucceededRunStepAttempt_Row = Extract<RunStepAttempt_Row, { state: "succeeded" }>;
+type FailedRunStepAttempt_Row = Extract<RunStepAttempt_Row, { state: "failed" }>;
+
+function formatRunStepAttempt(attempt: StartedRunStepAttempt_Row): StartedRunStepAttempt;
+function formatRunStepAttempt(attempt: SucceededRunStepAttempt_Row): SucceededRunStepAttempt;
+function formatRunStepAttempt(attempt: FailedRunStepAttempt_Row): FailedRunStepAttempt;
+function formatRunStepAttempt(attempt: RunStepAttempt_Row): RunStepAttempt;
+function formatRunStepAttempt(attempt: RunStepAttempt_Row): RunStepAttempt {
+  switch (attempt.state) {
+    case "started":
+      return {
+        id: attempt.id,
+        stepId: attempt.step_id,
+        startedAt: new Date(attempt.started_at),
+        state: "started"
+      };
+    case "succeeded": {
+      const base = {
+        id: attempt.id,
+        stepId: attempt.step_id,
+        startedAt: new Date(attempt.started_at),
+        state: "succeeded" as const,
+        endedAt: new Date(attempt.ended_at)
+      };
+      if (attempt.result_type === "json") {
+        return { ...base, resultType: "json" as const, resultJson: attempt.result_json };
       }
-    case "wait":
-      switch (step.state) {
-        case "waiting":
-          return {
-            type: "wait",
-            id: step.id,
-            state: "waiting",
-            eventName: step.event_name,
-            timeoutAt: step.timeout_at ? new Date(step.timeout_at) : undefined,
-            createdAt: new Date(step.created_at),
-            parentStepId: step.parent_step_id
-          } satisfies WaitStep;
-        case "satisfied":
-          return {
-            type: "wait",
-            id: step.id,
-            state: "satisfied",
-            payload: step.payload,
-            createdAt: new Date(step.created_at),
-            eventName: step.event_name,
-            resolvedAt: new Date(step.resolved_at),
-            parentStepId: step.parent_step_id
-          } satisfies WaitStep;
-        case "timed_out":
-          return {
-            type: "wait",
-            id: step.id,
-            state: "timed_out",
-            eventName: step.event_name,
-            resolvedAt: new Date(step.resolved_at),
-            createdAt: new Date(step.created_at),
-            parentStepId: step.parent_step_id
-          } satisfies WaitStep;
-        default:
-          throw new Error("Unexpected step state");
-      }
-    default:
-      throw new Error("Unexpected step type");
+      return { ...base, resultType: attempt.result_type };
+    }
+    case "failed":
+      return {
+        id: attempt.id,
+        stepId: attempt.step_id,
+        startedAt: new Date(attempt.started_at),
+        state: "failed",
+        errorMessage: attempt.error_message,
+        errorName: attempt.error_name ?? undefined,
+        endedAt: new Date(attempt.ended_at),
+        nextAttemptAt: attempt.next_attempt_at != null ? new Date(attempt.next_attempt_at) : undefined
+      };
   }
 }
 
-/**
- * Formatted `step_events` row for application use.
- */
-type StepEvent = {
-  id: string;
-  stepId: string;
-  recordedAt: Date;
-} & (
-  | {
-      type: "attempt_started";
-      attemptNumber: number;
-    }
-  | {
-      type: "attempt_succeeded";
-      attemptNumber: number;
-      result?: string;
-    }
-  | {
-      type: "attempt_failed";
-      attemptNumber: number;
-      errorMessage: string;
-      errorName?: string;
-      nextAttemptAt?: Date;
-    }
-  | {
-      type: "sleep_waiting";
-      wakeAt: Date;
-    }
-  | {
-      type: "sleep_elapsed";
-    }
-  | {
-      type: "wait_waiting";
-      eventName: string;
-      timeoutAt?: Date;
-    }
-  | {
-      type: "wait_satisfied";
-      payload?: string;
-    }
-  | {
-      type: "wait_timed_out";
-    }
-);
+function formatRunStep(step: RunStep_Row): RunStep {
+  return {
+    type: "run",
+    id: step.id,
+    createdAt: new Date(step.created_at),
+    maxAttempts: step.max_attempts,
+    parentStepId: step.parent_step_id
+  };
+}
 
-function formatStepEvent(row: StepEventRow): StepEvent {
-  switch (row.type) {
-    case "attempt_started":
+function formatSleepStep(step: SleepStep_Row): SleepStep {
+  switch (step.state) {
+    case "waiting":
       return {
-        id: row.id,
-        type: "attempt_started",
-        attemptNumber: row.attempt_number,
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "attempt_succeeded":
+        type: "sleep",
+        id: step.id,
+        state: "waiting",
+        wakeAt: new Date(step.target_wake_at),
+        createdAt: new Date(step.created_at),
+        parentStepId: step.parent_step_id
+      } satisfies SleepStep;
+    case "elapsed":
       return {
-        id: row.id,
-        type: "attempt_succeeded",
-        attemptNumber: row.attempt_number,
-        result: row.result,
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "attempt_failed":
-      return {
-        id: row.id,
-        type: "attempt_failed",
-        attemptNumber: row.attempt_number,
-        errorMessage: row.error_message,
-        errorName: row.error_name ?? undefined,
-        nextAttemptAt: row.next_attempt_at ? new Date(row.next_attempt_at) : undefined,
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "sleep_waiting":
-      return {
-        id: row.id,
-        type: "sleep_waiting",
-        wakeAt: new Date(row.wake_at),
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "sleep_elapsed":
-      return {
-        id: row.id,
-        type: "sleep_elapsed",
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "wait_waiting":
-      return {
-        id: row.id,
-        type: "wait_waiting",
-        eventName: row.event_name,
-        timeoutAt: row.timeout_at ? new Date(row.timeout_at) : undefined,
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "wait_satisfied":
-      return {
-        id: row.id,
-        type: "wait_satisfied",
-        payload: row.payload,
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
-    case "wait_timed_out":
-      return {
-        id: row.id,
-        type: "wait_timed_out",
-        stepId: row.step_id,
-        recordedAt: new Date(row.recorded_at)
-      };
+        type: "sleep",
+        id: step.id,
+        state: "elapsed",
+        resolvedAt: new Date(step.resolved_at),
+        createdAt: new Date(step.created_at),
+        parentStepId: step.parent_step_id
+      } satisfies SleepStep;
+    default:
+      throw new Error("Unexpected sleep step state");
   }
+}
+
+function formatWaitingWaitStep(step: WaitingWaitStep_Row): WaitingWaitStep {
+  return {
+    type: "wait",
+    id: step.id,
+    state: "waiting",
+    eventName: step.event_name,
+    timeoutAt: step.timeout_at != null ? new Date(step.timeout_at) : undefined,
+    createdAt: new Date(step.created_at),
+    parentStepId: step.parent_step_id
+  };
+}
+
+function formatTimedOutWaitStep(step: TimedOutWaitStep_Row): TimedOutWaitStep {
+  return {
+    type: "wait",
+    id: step.id,
+    state: "timed_out",
+    eventName: step.event_name,
+    resolvedAt: new Date(step.resolved_at),
+    createdAt: new Date(step.created_at),
+    parentStepId: step.parent_step_id,
+    timeoutAt: new Date(step.timeout_at)
+  };
+}
+
+function formatSatisfiedWaitStep<T extends Json | undefined>(
+  step: SatisfiedWaitStep_Row,
+  payload: T
+): SatisfiedWaitStep<T> {
+  return {
+    type: "wait",
+    id: step.id,
+    state: "satisfied",
+    payload: payload,
+    createdAt: new Date(step.created_at),
+    eventName: step.event_name,
+    resolvedAt: new Date(step.resolved_at),
+    parentStepId: step.parent_step_id,
+    timeoutAt: step.timeout_at != null ? new Date(step.timeout_at) : undefined
+  };
 }
 
 /**
@@ -1332,128 +1159,56 @@ type RunStep_Row = {
    * Enclosing run step id when this run step was created inside that run's callback; otherwise null.
    */
   parent_step_id: RunStepId | null;
-
-  /**
-   * Number of attempts that have been durably started for this step.
-   *
-   * Invariants:
-   *
-   * - `0` before the first attempt starts
-   * - Incremented exactly when an attempt transitions into `running`
-   * - Never decremented
-   * - Unchanged while the step is pending between retries/backoff
-   *
-   * When greater than `0`, this is also the 1-based number of the most recently started attempt. The next attempt, if
-   * one is started, will have number `attempts_started + 1`.
-   */
-  attempt_count: number;
   /**
    * Maximum number of attempts that can be made for this step. If not present, the step can be retried indefinitely. If
    * present, the step can be retried up to this number of times. If the step has reached the maximum number of
    * attempts, it will transition to the `failed` state.
    */
   max_attempts: number | null;
-} & (
-  | {
-      /**
-       * The step has been reached but is not yet resolved, and no attempt is currently in progress.
-       *
-       * This includes steps that: 1. have been reached but have not yet started their first attempt 2. are waiting
-       * until a retry/backoff time 3. are eligible to run immediately.
-       */
-      state: "pending";
-
-      /**
-       * Earliest time at which the next attempt may start.
-       *
-       * Semantics: - On first creation, this is typically set to "now", meaning the step is immediately runnable. -
-       * After a failed attempt with backoff, this is set to the retry time. - While the current time is before this
-       * value, the step remains `pending` and no new attempt may start. - Once the current time reaches or passes this
-       * value, the step becomes eligible to transition from `pending` to `running`.
-       */
-      next_attempt_at: number;
-    }
-  | {
-      /**
-       * An attempt was durably started, but its outcome has not yet been durably recorded.
-       *
-       * This does not guarantee that code is actively executing at this instant. After a restart or interruption,
-       * `running` means only that a start was recorded and no durable success/failure was recorded afterward.
-       */
-      state: "running";
-    }
-  | {
-      /**
-       * The step completed successfully and its result was durably recorded.
-       */
-      state: "succeeded";
-
-      /**
-       * Serialized successful result for the step.
-       */
-      result: string;
-
-      /**
-       * Time at which the step became terminal by succeeding.
-       */
-      resolved_at: number;
-    }
-  | {
-      /**
-       * The step failed terminally and no further attempts will be made.
-       */
-      state: "failed";
-
-      /**
-       * Serialized failure message for the terminal failure.
-       */
-      error_message: string;
-
-      /**
-       * Optional serialized error class/name for the terminal failure.
-       */
-      error_name: string | null;
-
-      /**
-       * Time at which the step became terminal by failing.
-       */
-      resolved_at: number;
-    }
-);
+};
 
 type SleepStep_Row = {
   id: SleepStepId;
   type: "sleep";
   created_at: number;
   /**
-   * Enclosing run step id when this sleep step was created inside that run's callback; otherwise null.
+   * Id of the enclosing run step if this sleep step was created from within that run step's callback; otherwise null.
    */
   parent_step_id: RunStepId | null;
 } & (
   | {
       /**
-       * The sleep step has been reached and is currently in effect.
+       * The sleep step has started and is not yet terminal.
        *
-       * `waiting` here means "started but not yet resolved", not "not yet started". The step remains waiting until its
-       * wake time is reached.
+       * In this state, the step is considered active until its target wake time is reached and that transition is
+       * durably recorded.
        */
       state: "waiting";
 
       /**
-       * Earliest time at which the sleep condition becomes satisfied.
+       * Target time at or after which this sleep step may transition to `elapsed`.
        *
-       * Before this moment, the step remains waiting. At or after this moment, the step may be marked elapsed.
+       * This is part of the step's configured behavior, not an indicator that the step is still pending.
        */
-      wake_at: number;
+      target_wake_at: number;
     }
   | {
       /**
-       * The sleep interval elapsed and that fact was durably recorded.
+       * The sleep step has completed because its target wake time was reached and that outcome was durably recorded.
        */
       state: "elapsed";
 
       /**
-       * Time at which the sleep step became terminal by completing.
+       * Target time at or after which this sleep step became eligible to transition to `elapsed`.
+       *
+       * Retained on terminal rows so the completed step still carries its original timing configuration.
+       */
+      target_wake_at: number;
+
+      /**
+       * Time at which the transition to `elapsed` was durably recorded.
+       *
+       * This may be equal to or later than `target_wake_at`.
        */
       resolved_at: number;
     }
@@ -1464,176 +1219,79 @@ type WaitStep_Row = {
   type: "wait";
   created_at: number;
   /**
-   * Enclosing run step id when this wait step was created inside that run's callback; otherwise null.
+   * Id of the enclosing run step if this wait step was created from within that run step's callback; otherwise null.
    */
   parent_step_id: RunStepId | null;
 
   /**
-   * Name of the inbound event that can satisfy this step.
+   * Name of the inbound event that can satisfy this wait step.
    */
   event_name: string;
 } & (
   | {
       /**
-       * The step has been reached, but the expected event has not yet been durably received, and no timeout failure has
-       * been durably recorded.
+       * The wait step has started and is not yet terminal.
+       *
+       * In this state, the expected event has not yet been durably matched to the step, and no timeout outcome has been
+       * durably recorded.
        */
       state: "waiting";
 
       /**
-       * Optional deadline after which the wait step may fail.
+       * Optional time at or after which this wait step may transition to `timed_out`.
        *
-       * - If omitted, the step may wait indefinitely.
-       * - If present, reaching or passing this time allows the step to transition to `failed`.
+       * - If null, the step may wait indefinitely.
+       * - If set, reaching or passing this time makes the step eligible to time out.
        */
       timeout_at: number | null;
     }
   | {
       /**
-       * The expected event was received and its payload was durably recorded.
+       * The wait step has completed because a matching event was durably received and recorded.
        */
       state: "satisfied";
 
       /**
-       * Serialized payload of the event that satisfied the wait.
+       * Optional timeout that applied while this step was active.
+       *
+       * Retained on terminal rows so the completed step still carries its original timing configuration.
        */
-      payload: string;
+      timeout_at: number | null;
 
       /**
-       * Time at which the wait step became terminal by receiving the expected event.
+       * Time at which the transition to `satisfied` was durably recorded.
        */
       resolved_at: number;
     }
   | {
       /**
-       * The step failed because its timeout was reached before the expected event was durably recorded.
+       * The wait step has completed by timing out before a matching event was durably received.
        */
       state: "timed_out";
 
       /**
-       * Time at which the wait step became terminal by timing out.
+       * Time at or after which this step became eligible to transition to `timed_out`.
+       */
+      timeout_at: number;
+
+      /**
+       * Time at which the transition to `timed_out` was durably recorded.
+       *
+       * This may be equal to or later than `timeout_at`.
        */
       resolved_at: number;
     }
 );
+
+type WaitingWaitStep_Row = Extract<WaitStep_Row, { state: "waiting" }>;
+type SatisfiedWaitStep_Row = Extract<WaitStep_Row, { state: "satisfied" }>;
+type TimedOutWaitStep_Row = Extract<WaitStep_Row, { state: "timed_out" }>;
 
 /**
  * A step row is created once the workflow reaches that step. From that point on, `status` describes the step's durable
  * lifecycle state.
  */
 type Step_Row = RunStep_Row | SleepStep_Row | WaitStep_Row;
-
-/**
- * SQLite row shape for `step_events`: append-only durable transitions for steps.
- *
- * The `steps` table holds current state; `step_events` records how that state evolved.
- */
-type StepEventRow = {
-  id: string;
-
-  /**
-   * `steps.id` this event applies to.
-   */
-  step_id: RunStepId | SleepStepId | WaitStepId;
-
-  /**
-   * When this event row was persisted (`unixepoch` ms).
-   */
-  recorded_at: number;
-} & (
-  | {
-      /**
-       * A run step attempt was durably started.
-       *
-       * This corresponds to the step transitioning from `pending` → `running`.
-       */
-      type: "attempt_started";
-
-      /**
-       * 1-based attempt number.
-       *
-       * Equals the value of `attempts_started` after the transition.
-       */
-      attempt_number: number;
-    }
-  | {
-      /**
-       * A run step attempt completed successfully.
-       *
-       * The step transitioned from `running` to `succeeded`.
-       */
-      type: "attempt_succeeded";
-
-      attempt_number: number;
-
-      /**
-       * Serialized result produced by the step.
-       */
-      result: string;
-    }
-  | {
-      /**
-       * A run step attempt failed.
-       *
-       * The step either: - scheduled a next attempt, or - transitioned to terminal failure.
-       */
-      type: "attempt_failed";
-
-      attempt_number: number;
-
-      error_message: string;
-      error_name: string | null;
-
-      /**
-       * If present, the next attempt time.
-       *
-       * Absence indicates this failure was terminal.
-       */
-      next_attempt_at?: number;
-    }
-  | {
-      /**
-       * A sleep step began waiting.
-       *
-       * Corresponds to the step entering `waiting`.
-       */
-      type: "sleep_waiting";
-
-      /**
-       * Wake time for the sleep step.
-       */
-      wake_at: number;
-    }
-  | {
-      /**
-       * A sleep step completed because the wake condition became satisfied.
-       */
-      type: "sleep_elapsed";
-    }
-  | {
-      /**
-       * A wait step began waiting for the expected event.
-       */
-      type: "wait_waiting";
-
-      event_name: string;
-      timeout_at: number | null;
-    }
-  | {
-      /**
-       * A wait step was satisfied by receiving the expected event.
-       */
-      type: "wait_satisfied";
-
-      payload: string;
-    }
-  | {
-      /**
-       * A wait step failed because its timeout deadline was reached.
-       */
-      type: "wait_timed_out";
-    }
-);
 
 export type WorkflowStatus =
   | "pending" // The workflow has been created but 'run' hasn't been called yet
@@ -1651,55 +1309,56 @@ type WorkflowMetadata_Row<TVersion extends string> = {
   definition_input: string | null;
 };
 
-type WorkflowMetadata<TVersion extends string> = {
-  createdAt: Date;
-  updatedAt: Date;
-  status: WorkflowStatus;
-  definitionVersion?: TVersion;
-  definitionInput?: Json;
-};
-
-export function formatWorkflowMetadata<TVersion extends string>(
-  metadata: WorkflowMetadata_Row<TVersion>
-): WorkflowMetadata<TVersion> {
-  return {
-    createdAt: new Date(metadata.created_at),
-    updatedAt: new Date(metadata.updated_at),
-    status: metadata.status,
-    definitionVersion: metadata.definition_version ?? undefined,
-    definitionInput: metadata.definition_input ? JSON.parse(metadata.definition_input) : undefined
-  };
-}
 /**
  * Durable record of inbound events (`inbound_events`) that may satisfy wait steps.
  *
  * Persists delivered signals across restarts so step resolution is based on durable state rather than in-memory state.
  */
-export type InboundEventRow = {
-  /**
-   * Unique identifier for the event.
-   */
+type InboundEvent_Row = {
   id: string;
-  /**
-   * Name of the event.
-   *
-   * Used by wait steps to determine whether this event can satisfy them.
-   */
   event_name: string;
   /**
-   * Serialized payload delivered with the event.
+   * Raw JSON value, or SQL NULL for undefined (no payload).
    */
-  payload: string;
-  /**
-   * Time the event was durably recorded.
-   */
+  payload: string | null;
   created_at: number;
-  /**
-   * Step that claimed the event.
-   */
-  claimed_by?: RunStepId | SleepStepId | WaitStepId;
-  /**
-   * Time the event was claimed.
-   */
-  claimed_at?: number;
-};
+} & (
+  | {
+      /**
+       * Step that claimed the event.
+       */
+      claimed_by: WaitStepId;
+      /**
+       * Time the event was claimed.
+       */
+      claimed_at: number;
+    }
+  | {
+      claimed_by: null;
+      claimed_at: null;
+    }
+);
+
+type ClaimedInboundEvent_Row = Extract<
+  InboundEvent_Row,
+  {
+    claimed_by: WaitStepId;
+    claimed_at: number;
+  }
+>;
+
+type InboundEvent<T extends Json | undefined = Json | undefined> = {
+  id: string;
+  eventName: string;
+  payload: T;
+  createdAt: Date;
+} & (
+  | {
+      claimedBy: WaitStepId;
+      claimedAt: Date;
+    }
+  | {
+      claimedBy?: never;
+      claimedAt?: never;
+    }
+);

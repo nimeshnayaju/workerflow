@@ -54,15 +54,17 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
    *
    *   - { done: true; status: "completed" | "failed" }: the workflow has completed or aborted.
    *   - { done: false; resume: { type: "immediate" } }: the workflow should resume immediately.
-   *   - { done: false; resume: { type: "suspended" } }: the workflow should suspend itself and wait for the next alarm or
-   *     inbound event to resume.
+   *   - { done: false; resume: { type: "suspended", wakeAt?: number } }: the workflow should suspend itself and wait for
+   *     the next alarm or inbound event to resume. The `wakeAt` property is the timestamp at which the workflow should
+   *     wake up. If the `wakeAt` property is not present, the workflow should wait for the next inbound event to
+   *     resume.
    * @internal
    */
   async next(context: WorkflowRuntimeContext): Promise<
     | { done: true; status: "completed" | "failed" }
     | {
         done: false;
-        resume: { type: "immediate" } | { type: "suspended" };
+        resume: { type: "immediate" } | { type: "suspended"; wakeAt?: number };
       }
   > {
     this.#context = context;
@@ -75,7 +77,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       if (error instanceof ResumeImmediatelyError) {
         return { done: false, resume: { type: "immediate" } };
       } else if (error instanceof SuspendWorkflowError) {
-        return { done: false, resume: { type: "suspended" } };
+        return { done: false, resume: { type: "suspended", wakeAt: error.wakeAt } };
       } else if (error instanceof AbortWorkflowError) {
         return { done: true, status: "failed" };
       } else if (
@@ -89,24 +91,24 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         // An exception can be thrown when calling a method on the WorkflowContext RPC target.
         // The resulting exception will have a 'remote' property set to 'True' in this case.
         if (error instanceof Error && "remote" in error && error.remote) {
-          console.info(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
           /**
            * When calling Durable Objects from a Worker, errors may include .retryable and .overloaded properties
-           * indicating whether the operation can be retried. See:
-           * https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/#handle-errors-and-use-exception-boundaries.
+           * indicating whether the operation can be retried.
+           *
+           * See: https://developers.cloudflare.com/durable-objects/best-practices/error-handling/
            */
           if ("retryable" in error && error.retryable) {
-            return { done: false, resume: { type: "suspended" } };
-          }
-          // An 'WorkflowInvariantError' indicates that the workflow engine is in an invalid state and the workflow should be aborted.
-          else if (error.message.startsWith("WorkflowInvariantError")) {
+            console.info(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
+            // If the error is retryable, we hint the workflow to suspend and retry after 5 minutes.
+            // In future, we can use a more sophisticated retry strategy.
+            return { done: false, resume: { type: "suspended", wakeAt: new Date().getTime() + 5 * 60 * 1000 } };
+          } else {
+            console.error(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
+            // All other (non-retryable) errors are considered fatal and the workflow should be aborted.
             return { done: true, status: "failed" };
           }
-          // All other remote errors are considered to be transient, so we instruct the workflow to suspend itself and wait for the next alarm to resume.
-          else {
-            return { done: false, resume: { type: "suspended" } };
-          }
         }
+
         // All other non-remote errors are considered fatal and the workflow should be aborted.
         console.error(error instanceof Error ? error : String(error), {
           requestId: this.#requestId,
@@ -137,6 +139,51 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
   abstract execute(): Promise<void>;
 
+  async #processRunStepAttempt<T extends Json | undefined | void>(
+    stepId: RunStepId,
+    ctx: WorkflowRuntimeContext,
+    callback: () => Promise<T>
+  ): Promise<T> {
+    let _result: unknown;
+    try {
+      _result = await this.#runStepFrameContext.run(
+        { numOfSuccessfulRunCallbacks: 0, parentStepId: stepId },
+        async () => await callback()
+      );
+    } catch (error) {
+      /**
+       * A 'run' step callback can include nested steps that can throw control flow errors like 'ResumeImmediatelyError'
+       * and 'SuspendWorkflowError'. We rethrow these errors without recording a failure on this (parent) attempt.
+       */
+      if (error instanceof ResumeImmediatelyError || error instanceof SuspendWorkflowError) {
+        throw error;
+      }
+
+      const updated = await ctx.handleRunAttemptFailed(stepId, {
+        errorMessage: String(error),
+        errorName: error instanceof Error ? error.name : undefined,
+        isNonRetryableStepError: error instanceof NonRetryableStepError
+      });
+
+      if (error instanceof NonRetryableStepError) throw error;
+
+      if (updated.nextAttemptAt === undefined) {
+        const error = new MaxAttemptsExceededError();
+        Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
+        throw error;
+      }
+
+      throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
+    }
+
+    // SQL NULL (resultJson === null) encodes `undefined`; otherwise raw JSON.stringify for the value.
+    const resultJson = _result === undefined ? null : JSON.stringify(_result);
+    await ctx.handleRunAttemptSucceeded(stepId, resultJson);
+
+    this.#getRunStepFrame().numOfSuccessfulRunCallbacks += 1;
+    return _result as T;
+  }
+
   protected async run<T extends Json | undefined | void>(
     id: string,
     callback: () => Promise<T>,
@@ -156,8 +203,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
     const parentStepId = this.#getRunStepFrame().parentStepId;
 
-    const step = await ctx.getOrCreateStep(runStepId, {
-      type: "run",
+    const step = await ctx.getOrCreateRunStep(runStepId, {
       maxAttempts: config?.maxAttempts,
       parentStepId
     });
@@ -166,160 +212,49 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       throw new ResumeImmediatelyError();
     }
 
-    if (step.state === "pending") {
-      if (step.nextAttemptAt.getTime() > Date.now()) {
-        throw new SuspendWorkflowError();
-      }
+    const lastAttempt = step.attempts[step.attempts.length - 1];
+    if (lastAttempt === undefined) {
+      await ctx.handleRunAttemptStarted(runStepId);
 
-      const attemptCount = step.attemptCount + 1; // Increment the attempt count by 1 as we're starting a new attempt
-      const maxAttempts = step.maxAttempts;
-
-      await ctx.handleRunAttemptEvent(runStepId, {
-        type: "running",
-        attemptCount: attemptCount
-      });
-
-      let _result: unknown;
-      try {
-        _result = await this.#runStepFrameContext.run(
-          { numOfSuccessfulRunCallbacks: 0, parentStepId: runStepId },
-          async () => await callback()
-        );
-      } catch (error) {
-        // 'ResumeImmediatelyError' and 'SuspendWorkflowError' are rethrown so a nested `run()` does not record a spurious failure on the parent.
-        if (error instanceof ResumeImmediatelyError || error instanceof SuspendWorkflowError) {
-          throw error;
-        }
-
-        await ctx.handleRunAttemptEvent(runStepId, {
-          type: "failed",
-          errorMessage: String(error),
-          errorName: error instanceof Error ? error.name : undefined,
-          attemptCount: attemptCount,
-          isNonRetryableStepError: error instanceof NonRetryableStepError
-        });
-
-        if (error instanceof NonRetryableStepError) {
-          throw error;
-        }
-
-        if (maxAttempts !== null && attemptCount >= maxAttempts) {
-          const error = new MaxAttemptsExceededError();
-          Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
-          throw error;
-        }
-
-        throw new SuspendWorkflowError();
-      }
-
-      let result: string;
-      if (_result === undefined) {
-        result = "{}";
-      } else {
-        result = JSON.stringify({ value: _result });
-      }
-
-      await ctx.handleRunAttemptEvent(runStepId, {
-        type: "succeeded",
-        attemptCount: attemptCount,
-        result: result
-      });
-
-      this.#getRunStepFrame().numOfSuccessfulRunCallbacks += 1;
-
-      return _result as T;
-    } else if (step.state === "running") {
-      const maxAttempts = step.maxAttempts;
-      const attemptCount = step.attemptCount;
-
-      // If no direct child row explains the parent still being `running` (see `hasRunningOrWaitingChildSteps`), fail the attempt as interrupted.
-      if (!(await ctx.hasRunningOrWaitingChildSteps(runStepId))) {
-        await ctx.handleRunAttemptEvent(runStepId, {
-          type: "failed",
+      return await this.#processRunStepAttempt(runStepId, ctx, callback);
+    } else if (lastAttempt.state === "started") {
+      const hasInProgressChildSteps = await ctx.hasInProgressChildSteps(runStepId);
+      if (!hasInProgressChildSteps) {
+        const updated = await ctx.handleRunAttemptFailed(runStepId, {
           errorMessage: STEP_EXECUTION_INTERRUPTED_ERROR_MESSAGE,
-          errorName: undefined,
-          attemptCount: attemptCount
+          errorName: undefined
         });
 
-        if (maxAttempts !== null && attemptCount >= maxAttempts) {
+        if (updated.nextAttemptAt === undefined) {
           const error = new MaxAttemptsExceededError();
           Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
           throw error;
+        }
+
+        throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
+      } else {
+        return await this.#processRunStepAttempt(runStepId, ctx, callback);
+      }
+    } else if (lastAttempt.state === "failed") {
+      if (lastAttempt.nextAttemptAt) {
+        if (lastAttempt.nextAttemptAt.getTime() <= Date.now()) {
+          await ctx.handleRunAttemptStarted(runStepId);
+          return await this.#processRunStepAttempt(runStepId, ctx, callback);
         } else {
-          throw new SuspendWorkflowError();
+          throw new SuspendWorkflowError(lastAttempt.nextAttemptAt.getTime());
         }
+      } else {
+        throw new AbortWorkflowError();
       }
-
-      // Direct children in non-failure states: continue the same attempt by re-entering the callback.
-      let _result: unknown;
-      try {
-        _result = await this.#runStepFrameContext.run(
-          { numOfSuccessfulRunCallbacks: 0, parentStepId: runStepId },
-          async () => await callback()
-        );
-      } catch (error) {
-        if (error instanceof ResumeImmediatelyError || error instanceof SuspendWorkflowError) {
-          throw error;
-        }
-
-        await ctx.handleRunAttemptEvent(runStepId, {
-          type: "failed",
-          errorMessage: String(error),
-          errorName: error instanceof Error ? error.name : undefined,
-          attemptCount: attemptCount,
-          isNonRetryableStepError: error instanceof NonRetryableStepError
-        });
-
-        if (error instanceof NonRetryableStepError) {
-          throw error;
-        }
-
-        if (maxAttempts !== null && attemptCount >= maxAttempts) {
-          const err = new MaxAttemptsExceededError();
-          Error.captureStackTrace(err, WorkflowDefinition.prototype.run);
-          throw err;
-        }
-
-        throw new SuspendWorkflowError();
+    } else if (lastAttempt.state === "succeeded") {
+      // Replay: the callback is NOT re-executed. Reconstruct the return value from durable state.
+      if (lastAttempt.resultType === "json") {
+        return JSON.parse(lastAttempt.resultJson) as T;
       }
-
-      const result: string = _result === undefined ? "{}" : JSON.stringify({ value: _result });
-
-      await ctx.handleRunAttemptEvent(runStepId, {
-        type: "succeeded",
-        attemptCount: attemptCount,
-        result: result
-      });
-
-      this.#getRunStepFrame().numOfSuccessfulRunCallbacks += 1;
-
-      return _result as T;
-    } else if (step.state === "failed") {
-      throw new AbortWorkflowError();
-    } else if (step.state === "succeeded") {
-      const parsed: unknown = JSON.parse(step.result);
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        throw new Error(
-          "Invalid stored workflow result; expected a non-null object payload; storage may be corrupted or written by an incompatible version."
-        );
-      }
-
-      const keys = Object.keys(parsed);
-      // "{}" means top-level undefined
-      if (keys.length === 0) {
-        return undefined as T;
-      }
-
-      if (keys.length === 1 && Object.hasOwn(parsed, "value")) {
-        return (parsed as { value: T }).value;
-      }
-
-      throw new Error(
-        "Invalid stored workflow result; expected an object payload with a 'value' property or an empty object; storage may be corrupted or written by an incompatible version."
-      );
+      return undefined as T;
+    } else {
+      throw new Error("Unexpected run step attempt state; expected 'started', 'failed', or 'succeeded'.");
     }
-
-    throw new Error("Unexpected run step state; expected 'pending', 'running', 'failed', or 'succeeded'.");
   }
 
   protected async sleep(id: string, duration: number): Promise<void> {
@@ -333,8 +268,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       throw error;
     }
 
-    const step = await ctx.getOrCreateStep(sleepStepId, {
-      type: "sleep",
+    const step = await ctx.getOrCreateSleepStep(sleepStepId, {
       wakeAt: new Date(Date.now() + duration),
       parentStepId: this.#getRunStepFrame().parentStepId
     });
@@ -345,11 +279,11 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
     } else if (step.state === "waiting") {
       // If the sleep step is not yet due to wake up, we suspend the workflow.
       if (Date.now() < step.wakeAt.getTime()) {
-        throw new SuspendWorkflowError();
+        throw new SuspendWorkflowError(step.wakeAt.getTime());
       }
       // If the sleep step is due to wake up, we mark the step as elapsed and throw a 'ResumeImmediatelyError' to hint the driver to resume the workflow immediately.
       else {
-        await ctx.handleSleepStepEvent(sleepStepId, { type: "elapsed" });
+        await ctx.handleSleepStepElapsed(sleepStepId);
         throw new ResumeImmediatelyError();
       }
     }
@@ -357,7 +291,11 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
     throw new Error("Unexpected sleep step state; expected 'waiting' or 'elapsed'.");
   }
 
-  protected async wait<T extends Json>(id: string, event: string, config?: { timeoutAt?: number }): Promise<T> {
+  protected async wait<T extends Json | undefined>(
+    id: string,
+    event: string,
+    config?: { timeoutAt?: number }
+  ): Promise<T> {
     const waitStepId = id as WaitStepId;
     this.#assertUniqueStepIdInCurrentExecution(waitStepId);
 
@@ -368,30 +306,34 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       throw error;
     }
 
-    const step = await ctx.getOrCreateStep(waitStepId, {
-      type: "wait",
+    const step = await ctx.getOrCreateWaitStep<T>(waitStepId, {
       eventName: event,
       timeoutAt: config?.timeoutAt ? new Date(config.timeoutAt) : undefined,
       parentStepId: this.#getRunStepFrame().parentStepId
     });
 
     if (step.state === "waiting") {
-      // If the wait step has a timeout and the timeout has been reached, we mark the step as timed out and throw an 'AbortWorkflowError' to abort the workflow.
-      if (step.timeoutAt !== undefined && Date.now() >= step.timeoutAt.getTime()) {
-        await ctx.handleWaitStepEvent(waitStepId, { type: "timed_out" });
-        const error = new WaitStepTimedOutError();
-        Error.captureStackTrace(error, WorkflowDefinition.prototype.wait);
-        throw error;
+      if (step.timeoutAt !== undefined) {
+        // If the timeout has been reached (or exceeded), we mark the step as timed out and throw an 'AbortWorkflowError' to abort the workflow.
+        if (Date.now() >= step.timeoutAt.getTime()) {
+          await ctx.handleWaitStepTimedOut(waitStepId);
+          const error = new WaitStepTimedOutError();
+          Error.captureStackTrace(error, WorkflowDefinition.prototype.wait);
+          throw error;
+        } else {
+          // If the timeout has not been reached, we suspend the workflow and wait for the next alarm to resume.
+          throw new SuspendWorkflowError(step.timeoutAt.getTime());
+        }
+      } else {
+        // If the wait step does not have a timeout, we suspend the workflow and wait for the next inbound event to resume.
+        throw new SuspendWorkflowError();
       }
-
-      // Otherwise, we hint the driver to suspend the workflow until the next alarm or inbound event to resume.
-      throw new SuspendWorkflowError();
     } else if (step.state === "timed_out") {
       // If the wait step has timed out, we throw an 'AbortWorkflowError' to abort the workflow.
       throw new AbortWorkflowError();
     } else if (step.state === "satisfied") {
       // If the wait step has been satisfied, we return the payload of the satisfied step.
-      return JSON.parse(step.payload) as T;
+      return step.payload;
     }
 
     throw new Error("Unexpected wait step state; expected 'waiting', 'satisfied', or 'timed_out'.");
@@ -399,7 +341,17 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 }
 
 class ResumeImmediatelyError extends Error {}
-class SuspendWorkflowError extends Error {}
+class SuspendWorkflowError extends Error {
+  readonly #wakeAt?: number;
+  constructor(wakeAt?: number) {
+    super();
+    this.#wakeAt = wakeAt;
+    this.name = "SuspendWorkflowError";
+  }
+  get wakeAt() {
+    return this.#wakeAt;
+  }
+}
 class AbortWorkflowError extends Error {}
 
 class MaxAttemptsExceededError extends Error {}

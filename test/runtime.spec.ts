@@ -3,6 +3,8 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import {
   WorkflowRuntimeContext,
+  type RunStep,
+  type RunStepAttempt,
   type RunStepId,
   type SleepStepId,
   type WaitStepId,
@@ -98,12 +100,14 @@ describe("WorkflowRuntime", () => {
         await expect(promise).resolves.toBe("failed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
-        expect(steps[0]).toMatchObject({
-          type: "run",
+        const step = steps[0]!;
+        expect(step.type).toBe("run");
+        const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(attempts).toHaveLength(1);
+        expect(attempts[0]).toMatchObject({
           state: "failed",
           errorMessage: "NonRetryableStepError: This is a non-retryable step error",
-          errorName: "NonRetryableStepError",
-          attemptCount: 1
+          errorName: "NonRetryableStepError"
         });
       });
     } finally {
@@ -136,12 +140,14 @@ describe("WorkflowRuntime", () => {
         await expect(promise).resolves.toBe("failed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
-        expect(steps[0]).toMatchObject({
-          type: "run",
+        const step = steps[0]!;
+        expect(step.type).toBe("run");
+        const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(attempts).toHaveLength(2);
+        expect(attempts[1]).toMatchObject({
           state: "failed",
           errorMessage: "Error: test",
-          errorName: "Error",
-          attemptCount: 2
+          errorName: "Error"
         });
       });
     } finally {
@@ -198,11 +204,12 @@ describe("WorkflowRuntime", () => {
         await expect(promise).resolves.toBe("completed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
-        expect(steps[0]).toMatchObject({
-          type: "run",
-          attemptCount: 2,
-          state: "succeeded"
-        });
+        const step = steps[0]!;
+        expect(step.type).toBe("run");
+        const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(attempts).toHaveLength(2);
+        expect(attempts[0]).toMatchObject({ state: "failed" });
+        expect(attempts[1]).toMatchObject({ state: "succeeded" });
         // First next(): failed attempt yields suspended. Retry alarm: second next() replays `execute()` and completes
         // the successful attempt in the same invocation (no extra immediate loop).
         expect(nextSpy).toHaveBeenCalledTimes(2);
@@ -266,8 +273,16 @@ describe("WorkflowRuntime", () => {
 
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(2);
-        expect(steps[0]).toMatchObject({ id: "step-a", type: "run", state: "succeeded" });
-        expect(steps[1]).toMatchObject({ id: "step-b", type: "run", state: "succeeded" });
+        const firstStep = steps[0]!;
+        expect(firstStep.id).toBe("step-a");
+        expect(firstStep.type).toBe("run");
+        const firstAttempts = (firstStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(firstAttempts[firstAttempts.length - 1]).toMatchObject({ state: "succeeded" });
+        const secondStep = steps[1]!;
+        expect(secondStep.id).toBe("step-b");
+        expect(secondStep.type).toBe("run");
+        const secondAttempts = (secondStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(secondAttempts[secondAttempts.length - 1]).toMatchObject({ state: "succeeded" });
 
         expect(nextSpy).toHaveBeenCalledTimes(2);
       });
@@ -300,7 +315,10 @@ describe("WorkflowRuntime", () => {
         await expect(promise).resolves.toBe("completed");
 
         const steps = instance.getSteps_experimental();
-        expect(steps.find((s) => s.id === "before-sleep")).toMatchObject({ type: "run", state: "succeeded" });
+        const before = steps.find((s) => s.id === "before-sleep");
+        expect(before?.type).toBe("run");
+        const beforeAttempts = (before as RunStep & { attempts: RunStepAttempt[] }).attempts;
+        expect(beforeAttempts[beforeAttempts.length - 1]).toMatchObject({ state: "succeeded" });
         expect(steps.find((s) => s.id === "sleep-after-run")).toMatchObject({
           type: "sleep",
           state: "elapsed",
@@ -414,26 +432,16 @@ describe("WorkflowRuntime", () => {
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
-          expect(steps.find((s) => s.id === "L0")).toMatchObject({
-            type: "run",
-            parentStepId: null,
-            state: "succeeded"
-          });
-          expect(steps.find((s) => s.id === "L1")).toMatchObject({
-            type: "run",
-            parentStepId: "L0",
-            state: "succeeded"
-          });
-          expect(steps.find((s) => s.id === "L2")).toMatchObject({
-            type: "run",
-            parentStepId: "L1",
-            state: "succeeded"
-          });
-
-          const events = await instance.getStepEvents_experimental();
-          for (const id of ["L0", "L1"] as const) {
-            expect(events.filter((event) => event.stepId === id && event.type === "attempt_failed")).toHaveLength(0);
+          for (const id of ["L0", "L1", "L2"] as const) {
+            const row = steps.find((s) => s.id === id);
+            expect(row?.type).toBe("run");
+            const attempts = (row as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(attempts.filter((a) => a.state === "failed")).toHaveLength(0);
+            expect(attempts[attempts.length - 1]).toMatchObject({ state: "succeeded" });
           }
+          expect(steps.find((s) => s.id === "L0")).toMatchObject({ parentStepId: null });
+          expect(steps.find((s) => s.id === "L1")).toMatchObject({ parentStepId: "L0" });
+          expect(steps.find((s) => s.id === "L2")).toMatchObject({ parentStepId: "L1" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -462,11 +470,11 @@ describe("WorkflowRuntime", () => {
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
-          expect(steps.find((s) => s.id === "root-after")).toMatchObject({
-            type: "run",
-            parentStepId: null,
-            state: "succeeded"
-          });
+          const rootAfter = steps.find((s) => s.id === "root-after");
+          expect(rootAfter?.type).toBe("run");
+          expect(rootAfter).toMatchObject({ parentStepId: null });
+          const raa = (rootAfter as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(raa[raa.length - 1]).toMatchObject({ state: "succeeded" });
           expect(steps.find((s) => s.id === "nest-inner")).toMatchObject({
             parentStepId: "nest-outer"
           });
@@ -504,30 +512,15 @@ describe("WorkflowRuntime", () => {
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
-          expect(steps.find((s) => s.id === "branch-a")).toMatchObject({
-            type: "run",
-            parentStepId: null,
-            state: "succeeded"
-          });
-          expect(steps.find((s) => s.id === "branch-a-inner")).toMatchObject({
-            type: "run",
-            parentStepId: "branch-a",
-            state: "succeeded"
-          });
-          expect(steps.find((s) => s.id === "branch-b")).toMatchObject({
-            type: "run",
-            parentStepId: null,
-            state: "succeeded"
-          });
-          expect(steps.find((s) => s.id === "branch-b-inner")).toMatchObject({
-            type: "run",
-            parentStepId: "branch-b",
-            state: "succeeded"
-          });
-
-          const events = await instance.getStepEvents_experimental();
-          expect(events.filter((event) => event.stepId === "branch-a" && event.type === "attempt_failed")).toHaveLength(0);
-          expect(events.filter((event) => event.stepId === "branch-b" && event.type === "attempt_failed")).toHaveLength(0);
+          for (const id of ["branch-a", "branch-a-inner", "branch-b", "branch-b-inner"] as const) {
+            const row = steps.find((s) => s.id === id);
+            expect(row?.type).toBe("run");
+            const attempts = (row as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(attempts.filter((a) => a.state === "failed")).toHaveLength(0);
+            expect(attempts[attempts.length - 1]).toMatchObject({ state: "succeeded" });
+          }
+          expect(steps.find((s) => s.id === "branch-a-inner")).toMatchObject({ parentStepId: "branch-a" });
+          expect(steps.find((s) => s.id === "branch-b-inner")).toMatchObject({ parentStepId: "branch-b" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -560,11 +553,11 @@ describe("WorkflowRuntime", () => {
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
-          expect(steps.find((s) => s.id === "nested-branch-inner")).toMatchObject({
-            type: "run",
-            parentStepId: "nested-branch",
-            state: "succeeded"
-          });
+          const nbInner = steps.find((s) => s.id === "nested-branch-inner");
+          expect(nbInner?.type).toBe("run");
+          expect(nbInner).toMatchObject({ parentStepId: "nested-branch" });
+          const nbia = (nbInner as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(nbia[nbia.length - 1]).toMatchObject({ state: "succeeded" });
           expect(steps.find((s) => s.id === "parallel-wait-nested")).toMatchObject({
             type: "wait",
             state: "waiting"
@@ -629,7 +622,10 @@ describe("WorkflowRuntime", () => {
           await instance.create({ definitionVersion: "2026-03-19" });
 
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "deep-wait")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "deep-wait");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           const stepsWaiting = instance.getSteps_experimental();
@@ -646,12 +642,12 @@ describe("WorkflowRuntime", () => {
             type: "wait",
             parentStepId: "outer-wait",
             state: "satisfied",
-            payload: JSON.stringify({ ok: true })
+            payload: { ok: true }
           });
-          expect(instance.getSteps_experimental().find((s) => s.id === "outer-wait")).toMatchObject({
-            type: "run",
-            state: "succeeded"
-          });
+          const outerWait = instance.getSteps_experimental().find((s) => s.id === "outer-wait");
+          expect(outerWait?.type).toBe("run");
+          const owa = (outerWait as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(owa[owa.length - 1]).toMatchObject({ state: "succeeded" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -681,16 +677,14 @@ describe("WorkflowRuntime", () => {
           await expect(promise).resolves.toBe("failed");
 
           const steps = instance.getSteps_experimental();
-          expect(steps.find((s) => s.id === "fail-inner")).toMatchObject({
-            type: "run",
-            state: "failed",
-            errorName: "NonRetryableStepError"
-          });
-          expect(steps.find((s) => s.id === "fail-outer")).toMatchObject({
-            type: "run",
-            state: "failed",
-            errorName: "NonRetryableStepError"
-          });
+          const fi = steps.find((s) => s.id === "fail-inner");
+          expect(fi?.type).toBe("run");
+          const fia = (fi as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(fia[fia.length - 1]).toMatchObject({ state: "failed", errorName: "NonRetryableStepError" });
+          const fo = steps.find((s) => s.id === "fail-outer");
+          expect(fo?.type).toBe("run");
+          const foa = (fo as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(foa[foa.length - 1]).toMatchObject({ state: "failed", errorName: "NonRetryableStepError" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -730,16 +724,15 @@ describe("WorkflowRuntime", () => {
             await expect(promise).resolves.toBe("completed");
 
             expect(innerAttempts).toBe(2);
-            const events = await instance.getStepEvents_experimental();
-            expect(events.filter((event) => event.stepId === "suspend-outer" && event.type === "attempt_failed")).toHaveLength(0);
-            expect(instance.getSteps_experimental().find((s) => s.id === "suspend-outer")).toMatchObject({
-              type: "run",
-              state: "succeeded"
-            });
-            expect(instance.getSteps_experimental().find((s) => s.id === "suspend-inner")).toMatchObject({
-              type: "run",
-              state: "succeeded"
-            });
+            const outerRow = instance.getSteps_experimental().find((s) => s.id === "suspend-outer");
+            expect(outerRow?.type).toBe("run");
+            const oa = (outerRow as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(oa.filter((a) => a.state === "failed")).toHaveLength(0);
+            expect(oa[oa.length - 1]).toMatchObject({ state: "succeeded" });
+            const innerRow = instance.getSteps_experimental().find((s) => s.id === "suspend-inner");
+            expect(innerRow?.type).toBe("run");
+            const ia = (innerRow as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(ia[ia.length - 1]).toMatchObject({ state: "succeeded" });
           });
         } finally {
           executeSpy.mockRestore();
@@ -773,17 +766,20 @@ describe("WorkflowRuntime", () => {
             await expect(promise).resolves.toBe("failed");
 
             const steps = instance.getSteps_experimental();
-            expect(steps.find((s) => s.id === "ex-inner")).toMatchObject({
-              type: "run",
+            const exInner = steps.find((s) => s.id === "ex-inner");
+            expect(exInner?.type).toBe("run");
+            const exIa = (exInner as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(exIa[exIa.length - 1]).toMatchObject({
               state: "failed",
               errorName: "Error",
               errorMessage: "Error: always fail"
             });
-            expect(steps.find((s) => s.id === "ex-outer")).toMatchObject({
-              type: "run",
+            const exOuter = steps.find((s) => s.id === "ex-outer");
+            expect(exOuter?.type).toBe("run");
+            const exOa = (exOuter as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(exOa[exOa.length - 1]).toMatchObject({
               state: "failed",
-              errorName: "Error",
-              errorMessage: "Error"
+              errorName: "Error"
             });
           });
         } finally {
@@ -813,12 +809,14 @@ describe("WorkflowRuntime", () => {
             await expect(promise).resolves.toBe("failed");
 
             const steps = instance.getSteps_experimental();
-            expect(steps.find((s) => s.id === "post-inner")).toMatchObject({
-              type: "run",
-              state: "succeeded"
-            });
-            expect(steps.find((s) => s.id === "post-outer")).toMatchObject({
-              type: "run",
+            const pi = steps.find((s) => s.id === "post-inner");
+            expect(pi?.type).toBe("run");
+            const pia = (pi as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(pia[pia.length - 1]).toMatchObject({ state: "succeeded" });
+            const po = steps.find((s) => s.id === "post-outer");
+            expect(po?.type).toBe("run");
+            const poa = (po as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(poa[poa.length - 1]).toMatchObject({
               state: "failed",
               errorMessage: expect.stringContaining("outer-only failure")
             });
@@ -849,21 +847,25 @@ describe("WorkflowRuntime", () => {
 
             await instance.create({ definitionVersion: "2026-03-19" });
             await expect
-              .poll(() => instance.getSteps_experimental().find((s) => s.id === "root-deep-wait")?.state)
+              .poll(() => {
+                const step = instance.getSteps_experimental().find((s) => s.id === "root-deep-wait");
+                return step?.type === "wait" ? step.state : undefined;
+              })
               .toBe("waiting");
 
-            const eventsBefore = await instance.getStepEvents_experimental();
-            expect(
-              eventsBefore.filter((event) => event.stepId === "root-wait-run" && event.type === "attempt_failed")
-            ).toHaveLength(0);
+            const rootRunBefore = instance.getSteps_experimental().find((s) => s.id === "root-wait-run");
+            expect(rootRunBefore?.type).toBe("run");
+            const rba = (rootRunBefore as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(rba.filter((a) => a.state === "failed")).toHaveLength(0);
 
             await instance.handleInboundEvent("root-deep-ev", true);
             await expect(promise).resolves.toBe("completed");
 
-            const eventsAfter = await instance.getStepEvents_experimental();
-            expect(
-              eventsAfter.filter((event) => event.stepId === "root-wait-run" && event.type === "attempt_failed")
-            ).toHaveLength(0);
+            const rootRunAfter = instance.getSteps_experimental().find((s) => s.id === "root-wait-run");
+            expect(rootRunAfter?.type).toBe("run");
+            const raa = (rootRunAfter as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(raa.filter((a) => a.state === "failed")).toHaveLength(0);
+            expect(raa[raa.length - 1]).toMatchObject({ state: "succeeded" });
           });
         } finally {
           executeSpy.mockRestore();
@@ -898,10 +900,10 @@ describe("WorkflowRuntime", () => {
 
           const steps = instance.getSteps_experimental();
           expect(steps).toHaveLength(2);
-          expect(steps.find((s) => s.id === "parallel-run")).toMatchObject({
-            type: "run",
-            state: "succeeded"
-          });
+          const prun = steps.find((s) => s.id === "parallel-run");
+          expect(prun?.type).toBe("run");
+          const pra = (prun as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(pra[pra.length - 1]).toMatchObject({ state: "succeeded" });
           expect(steps.find((s) => s.id === "parallel-wait")).toMatchObject({
             type: "wait",
             state: "waiting"
@@ -937,15 +939,14 @@ describe("WorkflowRuntime", () => {
 
           const steps = instance.getSteps_experimental();
           expect(steps).toHaveLength(2);
-          expect(steps.find((s) => s.id === "parallel-fail")).toMatchObject({
-            type: "run",
-            state: "failed",
-            errorName: "NonRetryableStepError"
-          });
-          expect(steps.find((s) => s.id === "parallel-ok")).toMatchObject({
-            type: "run",
-            state: "succeeded"
-          });
+          const pf = steps.find((s) => s.id === "parallel-fail");
+          expect(pf?.type).toBe("run");
+          const pfa = (pf as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(pfa[pfa.length - 1]).toMatchObject({ state: "failed", errorName: "NonRetryableStepError" });
+          const pok = steps.find((s) => s.id === "parallel-ok");
+          expect(pok?.type).toBe("run");
+          const poka = (pok as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(poka[poka.length - 1]).toMatchObject({ state: "succeeded" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -982,7 +983,10 @@ describe("WorkflowRuntime", () => {
           expect(terminalStatuses).toHaveLength(0);
 
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "allsettled-rerun-wait")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "allsettled-rerun-wait");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           const steps = instance.getSteps_experimental();
@@ -992,10 +996,10 @@ describe("WorkflowRuntime", () => {
           });
           // Unlike `Promise.all`, `allSettled` waits for every branch before returning, so the run can finish
           // durably before we rethrow the `wait()` rejection.
-          expect(steps.find((s) => s.id === "allsettled-rerun-run")).toMatchObject({
-            type: "run",
-            state: "succeeded"
-          });
+          const asRun = steps.find((s) => s.id === "allsettled-rerun-run");
+          expect(asRun?.type).toBe("run");
+          const asra = (asRun as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(asra[asra.length - 1]).toMatchObject({ state: "succeeded" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -1029,7 +1033,10 @@ describe("WorkflowRuntime", () => {
           expect(terminalStatuses).toHaveLength(0);
 
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "parallel-wait")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "parallel-wait");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           const steps = instance.getSteps_experimental();
@@ -1037,11 +1044,11 @@ describe("WorkflowRuntime", () => {
             type: "wait",
             state: "waiting"
           });
-          // `wait()` usually wins the race; the run branch can still be mid-flight so the step may not yet be "succeeded".
-          expect(steps.find((s) => s.id === "parallel-run")).toMatchObject({
-            type: "run",
-            state: "running"
-          });
+          // `wait()` usually wins the race; the run branch can still be mid-flight so the latest attempt may still be in flight.
+          const parRun = steps.find((s) => s.id === "parallel-run");
+          expect(parRun?.type).toBe("run");
+          const paa = (parRun as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(paa[paa.length - 1]).toMatchObject({ state: "started" });
         });
       } finally {
         executeSpy.mockRestore();
@@ -1113,7 +1120,10 @@ describe("WorkflowRuntime", () => {
           await instance.create({ definitionVersion: "2026-03-19" });
           await expect.poll(() => instance.getStatus()).toBe("running");
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "wait-1")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-1");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           await instance.pause();
@@ -1255,7 +1265,10 @@ describe("WorkflowRuntime", () => {
           await instance.create({ definitionVersion: "2026-03-19" });
 
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "wait-1")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-1");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           await instance.pause();
@@ -1295,7 +1308,10 @@ describe("WorkflowRuntime", () => {
 
           await instance.create({ definitionVersion: "2026-03-19" });
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "wait-1")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-1");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
           await instance.pause();
 
@@ -1307,7 +1323,7 @@ describe("WorkflowRuntime", () => {
           expect(instance.getSteps_experimental().find((s) => s.id === "wait-1")).toMatchObject({
             type: "wait",
             state: "satisfied",
-            payload: JSON.stringify({ data: "test" })
+            payload: { data: "test" }
           });
         });
       } finally {
@@ -1330,7 +1346,10 @@ describe("WorkflowRuntime", () => {
           await instance.create({ definitionVersion: "2026-03-19" });
           await expect.poll(() => instance.getStatus()).toBe("running");
           await expect
-            .poll(() => instance.getSteps_experimental().find((s) => s.id === "wait-1")?.state)
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-1");
+              return step?.type === "wait" ? step.state : undefined;
+            })
             .toBe("waiting");
 
           await instance.pause();
@@ -1341,6 +1360,235 @@ describe("WorkflowRuntime", () => {
 
         await runInDurableObject(stub, async (instance) => {
           expect(instance.getStatus()).toBe("paused");
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("handleInboundEvent()", () => {
+    it("persists satisfied wait payload on inbound_events with claimed_by pointing at the wait step", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.wait("wait-inbound-row", "evt-claim", {
+            timeoutAt: Date.now() + 86_400_000
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-inbound-row");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+
+          await instance.handleInboundEvent("evt-claim", { trace: "x" });
+          await expect(promise).resolves.toBe("completed");
+
+          const formatted = instance.getSteps_experimental().find((s) => s.id === "wait-inbound-row");
+          expect(formatted).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: { trace: "x" }
+          });
+
+          const rows = state.storage.sql
+            .exec<{ payload: string; claimed_by: string | null }>(
+              `SELECT payload, claimed_by FROM inbound_events WHERE claimed_by = ?`,
+              "wait-inbound-row"
+            )
+            .toArray();
+          expect(rows).toHaveLength(1);
+          expect(rows[0]!.claimed_by).toBe("wait-inbound-row");
+          expect(JSON.parse(rows[0]!.payload)).toEqual({ trace: "x" });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("satisfies a waiting wait step when called without a payload", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const payload = await this.wait<undefined>("wait-no-payload", "evt");
+          await this.run("after-wait-no-payload", async () => payload);
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-no-payload");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+
+          await instance.handleInboundEvent("evt");
+          await expect(promise).resolves.toBe("completed");
+
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-no-payload")).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: undefined
+          });
+
+          const afterWait = instance.getSteps_experimental().find((s) => s.id === "after-wait-no-payload");
+          expect(afterWait?.type).toBe("run");
+          const attempts = (afterWait as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[attempts.length - 1]).toMatchObject({
+            state: "succeeded",
+            resultType: "none"
+          });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("satisfies a waiting wait step when called with an explicit null payload", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const payload = await this.wait<null>("wait-null", "evt");
+          await this.run("after-wait-null", async () => payload);
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-null");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+
+          await instance.handleInboundEvent("evt", null);
+          await expect(promise).resolves.toBe("completed");
+
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-null")).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: null
+          });
+
+          const afterWait = instance.getSteps_experimental().find((s) => s.id === "after-wait-null");
+          expect(afterWait?.type).toBe("run");
+          const attempts = (afterWait as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[attempts.length - 1]).toMatchObject({
+            state: "succeeded",
+            resultType: "json",
+            resultJson: "null"
+          });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("satisfies a waiting wait step via queued payloadless event claimed on resume", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.wait("wait-queued", "evt");
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running" || status === "paused") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-queued");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+
+          await instance.pause();
+
+          // Queue the event without a payload while paused
+          await instance.handleInboundEvent("evt");
+
+          // The wait step should still be waiting (event was only queued, not claimed)
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-queued")).toMatchObject({
+            type: "wait",
+            state: "waiting"
+          });
+
+          await instance.resume();
+          await expect(promise).resolves.toBe("completed");
+
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-queued")).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: undefined
+          });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("is a no-op when the workflow is in a terminal state", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run("step-1", async () => "done");
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          // Should not throw even though there is no matching wait step
+          await instance.handleInboundEvent("any-event", { data: 1 });
+          expect(instance.getStatus()).toBe("completed");
         });
       } finally {
         executeSpy.mockRestore();
@@ -1513,20 +1761,22 @@ describe("WorkflowRuntime", () => {
     });
   });
 
+
   describe("WorkflowRuntimeContext", () => {
     describe("run steps", () => {
-      describe("getOrCreateStep()", () => {
+      describe("getOrCreateRunStep()", () => {
         it("creates a new run step", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const step = await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
             expect(step).toMatchObject({
               id: "step-1",
               type: "run",
-              state: "pending",
-              attemptCount: 0
+              maxAttempts: 3,
+              parentStepId: null
             });
+            expect(step.attempts).toEqual([]);
           });
         });
 
@@ -1534,25 +1784,19 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const first = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            const second = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
+            const first = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const second = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
             expect(first).toEqual(second);
           });
         });
 
-        it("does not write an 'attempt_started' step event when a run step is already in progress", async () => {
+        it("leaves attempts empty until handleRunAttemptStarted", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
+          await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-
-            await expect(instance.getStepEvents_experimental()).toMatchObject([]);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(step.attempts).toEqual([]);
           });
         });
 
@@ -1560,8 +1804,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const step = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), {
               maxAttempts: 5,
               parentStepId: null
             });
@@ -1574,14 +1817,14 @@ describe("WorkflowRuntime", () => {
         });
       });
 
-      describe("hasRunningOrWaitingChildSteps()", () => {
+      describe("hasInProgressChildSteps()", () => {
         it("returns false when the run step has no direct child rows", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("leaf"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("leaf"), { type: "running", attemptCount: 1 });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("leaf"))).resolves.toBe(false);
+            context.getOrCreateRunStep(createRunStepId("leaf"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("leaf"));
+            expect(context.hasInProgressChildSteps(createRunStepId("leaf"))).toBe(false);
           });
         });
 
@@ -1589,13 +1832,12 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("parent"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("parent"), { type: "running", attemptCount: 1 });
-            await context.getOrCreateStep(createRunStepId("child"), {
-              type: "run",
+            context.getOrCreateRunStep(createRunStepId("parent"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("parent"));
+            context.getOrCreateRunStep(createRunStepId("child"), {
               parentStepId: createRunStepId("parent")
             });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("parent"))).resolves.toBe(true);
+            expect(context.hasInProgressChildSteps(createRunStepId("parent"))).toBe(true);
           });
         });
 
@@ -1603,14 +1845,13 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("parent"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("parent"), { type: "running", attemptCount: 1 });
-            await context.getOrCreateStep(createRunStepId("child"), {
-              type: "run",
+            context.getOrCreateRunStep(createRunStepId("parent"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("parent"));
+            context.getOrCreateRunStep(createRunStepId("child"), {
               parentStepId: createRunStepId("parent")
             });
-            await context.handleRunAttemptEvent(createRunStepId("child"), { type: "running", attemptCount: 1 });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("parent"))).resolves.toBe(true);
+            context.handleRunAttemptStarted(createRunStepId("child"));
+            expect(context.hasInProgressChildSteps(createRunStepId("parent"))).toBe(true);
           });
         });
 
@@ -1618,14 +1859,13 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("gp"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("gp"), { type: "running", attemptCount: 1 });
-            await context.getOrCreateStep(createRunStepId("mid"), { type: "run", parentStepId: createRunStepId("gp") });
-            await context.getOrCreateStep(createRunStepId("leaf"), {
-              type: "run",
+            context.getOrCreateRunStep(createRunStepId("gp"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("gp"));
+            context.getOrCreateRunStep(createRunStepId("mid"), { parentStepId: createRunStepId("gp") });
+            context.getOrCreateRunStep(createRunStepId("leaf"), {
               parentStepId: createRunStepId("mid")
             });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("gp"))).resolves.toBe(true);
+            expect(context.hasInProgressChildSteps(createRunStepId("gp"))).toBe(true);
           });
         });
 
@@ -1633,14 +1873,13 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("mid"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("mid"), { type: "running", attemptCount: 1 });
-            await context.getOrCreateStep(createRunStepId("leaf"), {
-              type: "run",
+            context.getOrCreateRunStep(createRunStepId("mid"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("mid"));
+            context.getOrCreateRunStep(createRunStepId("leaf"), {
               parentStepId: createRunStepId("mid")
             });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("mid"))).resolves.toBe(true);
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("leaf"))).resolves.toBe(false);
+            expect(context.hasInProgressChildSteps(createRunStepId("mid"))).toBe(true);
+            expect(context.hasInProgressChildSteps(createRunStepId("leaf"))).toBe(false);
           });
         });
 
@@ -1648,20 +1887,15 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("par"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("par"), { type: "running", attemptCount: 1 });
-            await context.getOrCreateStep(createRunStepId("bad-child"), {
-              type: "run",
-              parentStepId: createRunStepId("par")
+            context.getOrCreateRunStep(createRunStepId("par"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("par"));
+            context.getOrCreateRunStep(createRunStepId("bad-child"), {
+              parentStepId: createRunStepId("par"),
+              maxAttempts: 1
             });
-            await context.handleRunAttemptEvent(createRunStepId("bad-child"), { type: "running", attemptCount: 1 });
-            await context.handleRunAttemptEvent(createRunStepId("bad-child"), {
-              type: "failed",
-              errorMessage: "x",
-              attemptCount: 1,
-              isNonRetryableStepError: true
-            });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("par"))).resolves.toBe(false);
+            context.handleRunAttemptStarted(createRunStepId("bad-child"));
+            context.handleRunAttemptFailed(createRunStepId("bad-child"), { errorMessage: "x" });
+            expect(context.hasInProgressChildSteps(createRunStepId("par"))).toBe(false);
           });
         });
 
@@ -1669,57 +1903,28 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("run-parent"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("run-parent"), { type: "running", attemptCount: 1 });
-            const wakeAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createSleepStepId("child-sleep"), {
-              type: "sleep",
-              wakeAt,
+            context.getOrCreateRunStep(createRunStepId("run-parent"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("run-parent"));
+            context.getOrCreateSleepStep(createSleepStepId("child-sleep"), {
+              wakeAt: new Date(Date.now() + 60_000),
               parentStepId: createRunStepId("run-parent")
             });
-            await expect(context.hasRunningOrWaitingChildSteps(createRunStepId("run-parent"))).resolves.toBe(true);
+            expect(context.hasInProgressChildSteps(createRunStepId("run-parent"))).toBe(true);
           });
         });
       });
 
-      describe("handleRunAttemptEvent({ type: 'running' })", () => {
-        it("moves a run step from 'pending' to 'running'", async () => {
+      describe("handleRunAttemptStarted()", () => {
+        it("inserts a started attempt", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
-              state: "running",
-              attemptCount: 1
-            });
-          });
-        });
-
-        it("writes an 'attempt_started' step event when a run step is started", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "attempt_started",
-                stepId: "step-1",
-                attemptNumber: 1,
-                recordedAt: expect.any(Date)
-              }
-            ]);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const started = context.handleRunAttemptStarted(createRunStepId("step-1"));
+            expect(started).toMatchObject({ state: "started", stepId: "step-1" });
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(step.attempts).toHaveLength(1);
+            expect(step.attempts[0]).toMatchObject({ state: "started" });
           });
         });
 
@@ -1727,148 +1932,55 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("nonexistent"), {
-                type: "running",
-                attemptCount: 1
-              })
-            ).rejects.toThrow(/not found/);
+            expect(() => context.handleRunAttemptStarted(createRunStepId("nonexistent"))).toThrow(/not found/);
           });
         });
 
-        it("throws when the step is not in 'pending' state", async () => {
+        it("throws when an attempt is already in progress", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "running",
-                attemptCount: 2
-              })
-            ).rejects.toThrow(/Expected 'pending' but got running/);
-          });
-        });
-
-        it("rejects when 'next_attempt_at' is in the future", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "backoff"
-            });
-            const future = Date.now() + 3600_000;
-            state.storage.sql.exec("UPDATE steps SET next_attempt_at = ? WHERE id = 'step-1'", future);
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "running",
-                attemptCount: 2
-              })
-            ).rejects.toThrow(/next attempt at/);
-          });
-        });
-
-        it("rejects when 'attemptCount' does not match the expected next attempt", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "running",
-                attemptCount: 99
-              })
-            ).rejects.toThrow(/Expected 98 but got 0/);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            expect(() => context.handleRunAttemptStarted(createRunStepId("step-1"))).toThrow(/already in progress/);
           });
         });
       });
 
-      describe("handleRunAttemptEvent({ type: 'succeeded' })", () => {
-        it("moves a run step from 'running' to 'succeeded'", async () => {
+      describe("handleRunAttemptSucceeded()", () => {
+        it("marks the in-flight attempt succeeded with a json result", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "succeeded",
-              attemptCount: 1,
-              result: JSON.stringify({ value: 0 })
-            });
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const done = context.handleRunAttemptSucceeded(createRunStepId("step-1"), JSON.stringify(0));
+            expect(done).toMatchObject({
               state: "succeeded",
-              attemptCount: 1,
-              result: JSON.stringify({ value: 0 }),
-              resolvedAt: expect.any(Date)
+              resultType: "json",
+              resultJson: JSON.stringify(0)
+            });
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(step.attempts).toHaveLength(1);
+            expect(step.attempts[0]).toMatchObject({
+              state: "succeeded",
+              resultType: "json",
+              resultJson: JSON.stringify(0)
             });
           });
         });
 
-        it("writes an 'attempt_succeeded' step event when a run step is succeeded", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "succeeded",
-              attemptCount: 1,
-              result: JSON.stringify({ value: 0 })
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "attempt_started",
-                stepId: "step-1",
-                attemptNumber: 1,
-                recordedAt: expect.any(Date)
-              },
-              {
-                type: "attempt_succeeded",
-                stepId: "step-1",
-                attemptNumber: 1,
-                recordedAt: expect.any(Date)
-              }
-            ]);
-          });
-        });
-
-        it("throws when the attempt number does not match", async () => {
+        it("marks the in-flight attempt succeeded with result_type none", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const done = context.handleRunAttemptSucceeded(createRunStepId("step-1"), null);
+            expect(done).toMatchObject({
+              state: "succeeded",
+              resultType: "none"
             });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "succeeded",
-                attemptCount: 999,
-                result: JSON.stringify({ value: 0 })
-              })
-            ).rejects.toThrow(/Unexpected attempt count/);
           });
         });
 
@@ -1876,327 +1988,111 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("nonexistent"), {
-                type: "succeeded",
-                attemptCount: 1,
-                result: JSON.stringify({ value: 0 })
-              })
-            ).rejects.toThrow(/not found/);
+            expect(() => context.handleRunAttemptSucceeded(createRunStepId("nonexistent"), null)).toThrow(/not found/);
           });
         });
 
-        it("rejects when the step is still in 'pending' state", async () => {
+        it("throws when no attempt is in progress", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "succeeded",
-                attemptCount: 1,
-                result: JSON.stringify({ value: 1 })
-              })
-            ).rejects.toThrow(/Expected 'running' but got pending/);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(() => context.handleRunAttemptSucceeded(createRunStepId("step-1"), null)).toThrow(
+              /No attempt in progress/
+            );
           });
         });
       });
 
-      describe("handleRunAttemptEvent({ type: 'failed' })", () => {
-        it("moves a run step from 'running' to 'failed'", async () => {
+      describe("handleRunAttemptFailed()", () => {
+        it("marks terminal failed when max attempts exhausted", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              maxAttempts: 1,
-              parentStepId: null
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "error"
-            });
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              maxAttempts: 1,
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
+            context.getOrCreateRunStep(createRunStepId("step-1"), { maxAttempts: 1, parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const failed = context.handleRunAttemptFailed(createRunStepId("step-1"), { errorMessage: "error" });
+            expect(failed).toMatchObject({
               state: "failed",
-              attemptCount: 1,
-              errorMessage: "error"
+              errorMessage: "error",
+              nextAttemptAt: undefined
             });
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(step.attempts).toHaveLength(1);
+            expect(step.attempts[0]).toMatchObject({ state: "failed", errorMessage: "error" });
           });
         });
 
-        it("writes an 'attempt_failed' step event when a run step is failed", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              maxAttempts: 1,
-              parentStepId: null
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "error"
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "attempt_started",
-                stepId: "step-1",
-                attemptNumber: 1,
-                recordedAt: expect.any(Date)
-              },
-              {
-                type: "attempt_failed",
-                stepId: "step-1",
-                attemptNumber: 1,
-                errorMessage: "error",
-                recordedAt: expect.any(Date)
-              }
-            ]);
-          });
-        });
-
-        it("moves a run step back to 'pending' when retries are available", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
-              state: "pending",
-              attemptCount: 1
-            });
-            expect(updatedStep).toHaveProperty("nextAttemptAt");
-            expect((updatedStep as { nextAttemptAt: Date }).nextAttemptAt.getTime()).toBeGreaterThan(Date.now());
-          });
-        });
-
-        it("moves a run step to 'failed' when 'isNonRetryableStepError' is true and retries are available", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              maxAttempts: 10,
-              parentStepId: null
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error",
-              isNonRetryableStepError: true
-            });
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
-              state: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
-          });
-        });
-
-        it("schedules an alarm when retries are available", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
-            const alarm = await state.storage.getAlarm();
-            expect(alarm).not.toBeNull();
-            expect(alarm).toBeGreaterThan(Date.now());
-          });
-        });
-
-        it("replaces an existing alarm when retries are available", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            await state.storage.setAlarm(Date.now() + 999_999);
-
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
-            const alarm = await state.storage.getAlarm();
-            expect(alarm).not.toBeNull();
-            expect(alarm).toBeLessThan(Date.now() + 999_999);
-          });
-        });
-
-        it("writes an 'attempt_failed' step event when retrying", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "attempt_started",
-                stepId: "step-1",
-                attemptNumber: 1
-              },
-              {
-                type: "attempt_failed",
-                stepId: "step-1",
-                attemptNumber: 1,
-                errorMessage: "transient error"
-              }
-            ]);
-          });
-        });
-
-        it("throws when the attempt number does not match", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "failed",
-                attemptCount: 999,
-                errorMessage: "error"
-              })
-            ).rejects.toThrow(/Unexpected attempt count/);
-          });
-        });
-
-        it("throws when the step does not exist", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("nonexistent"), {
-                type: "failed",
-                attemptCount: 1,
-                errorMessage: "error"
-              })
-            ).rejects.toThrow(/not found/);
-          });
-        });
-
-        it("uses backoff delay for next attempt when retrying", async () => {
+        it("records next_attempt_at when retries remain", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
             const before = Date.now();
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "running",
-              attemptCount: 1
-            });
-            await context.handleRunAttemptEvent(createRunStepId("step-1"), {
-              type: "failed",
-              attemptCount: 1,
-              errorMessage: "transient error"
-            });
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const failed = context.handleRunAttemptFailed(createRunStepId("step-1"), { errorMessage: "transient" });
             const after = Date.now();
-            const updatedStep = await context.getOrCreateStep(createRunStepId("step-1"), {
-              type: "run",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
-              state: "pending",
-              attemptCount: 1
-            });
-            const nextAttemptAt = (updatedStep as { nextAttemptAt: Date }).nextAttemptAt.getTime();
-            expect(nextAttemptAt).toBeGreaterThanOrEqual(before + 250);
-            expect(nextAttemptAt).toBeLessThanOrEqual(after + 500 + 100);
+            expect(failed.state).toBe("failed");
+            if (failed.state !== "failed") throw new Error("expected failed");
+            expect(failed.nextAttemptAt).toBeDefined();
+            expect(failed.nextAttemptAt!.getTime()).toBeGreaterThanOrEqual(before + 250);
+            expect(failed.nextAttemptAt!.getTime()).toBeLessThanOrEqual(after + 500 + 100);
           });
         });
 
-        it("rejects when the step is still in 'pending' state", async () => {
+        it("marks terminal failed when isNonRetryableStepError is true", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createRunStepId("step-1"), { type: "run", parentStepId: null });
-            await expect(
-              context.handleRunAttemptEvent(createRunStepId("step-1"), {
-                type: "failed",
-                attemptCount: 1,
-                errorMessage: "bad"
-              })
-            ).rejects.toThrow(/Expected 'running' but got pending/);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { maxAttempts: 10, parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const failed = context.handleRunAttemptFailed(createRunStepId("step-1"), {
+              errorMessage: "x",
+              isNonRetryableStepError: true
+            });
+            expect(failed).toMatchObject({ state: "failed", nextAttemptAt: undefined });
+          });
+        });
+
+        it("throws when the step does not exist", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            expect(() => context.handleRunAttemptFailed(createRunStepId("nonexistent"), { errorMessage: "e" })).toThrow(
+              /not found/
+            );
+          });
+        });
+
+        it("throws when no attempt is in progress", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(() => context.handleRunAttemptFailed(createRunStepId("step-1"), { errorMessage: "bad" })).toThrow(
+              /No attempt in progress/
+            );
           });
         });
       });
     });
 
     describe("sleep steps", () => {
-      describe("getOrCreateStep()", () => {
+      describe("getOrCreateSleepStep()", () => {
         it("creates a sleep step", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
             const wakeAt = new Date(Date.now() + 60_000);
-            const step = await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: wakeAt,
+            const step = context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
+              wakeAt,
               parentStepId: null
             });
             expect(step).toMatchObject({
               id: "sleep-1",
               type: "sleep",
               state: "waiting",
-              wakeAt: wakeAt
+              wakeAt
             });
           });
         });
@@ -2205,13 +2101,9 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const first = await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: new Date(),
-              parentStepId: null
-            });
-            const second = await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
+            const w = new Date();
+            const first = context.getOrCreateSleepStep(createSleepStepId("sleep-1"), { wakeAt: w, parentStepId: null });
+            const second = context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
               wakeAt: new Date(),
               parentStepId: null
             });
@@ -2219,114 +2111,42 @@ describe("WorkflowRuntime", () => {
           });
         });
 
-        it("writes a 'sleep_waiting' step event", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const wakeAt = new Date();
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: wakeAt,
-              parentStepId: null
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "sleep_waiting",
-                stepId: "sleep-1",
-                wakeAt: wakeAt,
-                recordedAt: expect.any(Date)
-              }
-            ]);
-          });
-        });
-
-        it("schedules an alarm", async () => {
+        it("does not set a durable object alarm by itself", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
             const wakeAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: wakeAt,
-              parentStepId: null
-            });
-            expect(await state.storage.getAlarm()).toBe(wakeAt.getTime());
-          });
-        });
-
-        it("replaces any existing alarm with a new alarm", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            await state.storage.setAlarm(Date.now() + 999_999);
-
-            const context = new WorkflowRuntimeContext(state.storage);
-            const wakeAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: wakeAt,
-              parentStepId: null
-            });
-            expect(await state.storage.getAlarm()).toBe(wakeAt.getTime());
-          });
-        });
-
-        it("does not schedule an alarm when an existing sleep step has a past wake_at", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const pastWakeAt = new Date(Date.now() - 10_000);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: pastWakeAt,
-              parentStepId: null
-            });
-            await state.storage.deleteAlarm();
-
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: pastWakeAt,
-              parentStepId: null
-            });
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), { wakeAt, parentStepId: null });
             expect(await state.storage.getAlarm()).toBeNull();
           });
         });
 
-        it("does not append a second sleep_waiting step_events row when the sleep step already exists", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const wakeAt = new Date(Date.now() + 30_000);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), { type: "sleep", wakeAt, parentStepId: null });
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), { type: "sleep", wakeAt, parentStepId: null });
-            const events = await instance.getStepEvents_experimental();
-            expect(events).toHaveLength(1);
-            expect(events[0]).toMatchObject({
-              type: "sleep_waiting",
-              stepId: "sleep-1",
-              wakeAt: wakeAt,
-              recordedAt: expect.any(Date)
-            });
-          });
-        });
-
-        it("does not set an alarm when re-reading an already elapsed sleep step", async () => {
+        it("leaves an existing alarm unchanged when creating a sleep step", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
+            const prior = Date.now() + 999_999;
+            await state.storage.setAlarm(prior);
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
               wakeAt: new Date(Date.now() + 60_000),
               parentStepId: null
             });
+            expect(await state.storage.getAlarm()).toBe(prior);
+          });
+        });
+
+        it("does not set an alarm when re-reading an existing sleep step after deleteAlarm", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            const pastWakeAt = new Date(Date.now() - 10_000);
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
+              wakeAt: pastWakeAt,
+              parentStepId: null
+            });
             await state.storage.deleteAlarm();
-            const now = Date.now();
-            state.storage.sql.exec(
-              "UPDATE steps SET state = 'elapsed', wake_at = NULL, resolved_at = ? WHERE id = 'sleep-1'",
-              now
-            );
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: new Date(),
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
+              wakeAt: pastWakeAt,
               parentStepId: null
             });
             expect(await state.storage.getAlarm()).toBeNull();
@@ -2334,53 +2154,24 @@ describe("WorkflowRuntime", () => {
         });
       });
 
-      describe("handleSleepStepEvent({ type: 'elapsed' })", () => {
+      describe("handleSleepStepElapsed()", () => {
         it("moves a sleep step from 'waiting' to 'elapsed'", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
               wakeAt: new Date(),
               parentStepId: null
             });
-            context.handleSleepStepEvent(createSleepStepId("sleep-1"), { type: "elapsed" });
-            const updatedStep = await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
+            context.handleSleepStepElapsed(createSleepStepId("sleep-1"));
+            const step = context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
               wakeAt: new Date(),
               parentStepId: null
             });
-            expect(updatedStep).toMatchObject({
+            expect(step).toMatchObject({
               state: "elapsed",
               resolvedAt: expect.any(Date)
             });
-          });
-        });
-
-        it("writes a 'sleep_elapsed' step event when a sleep step is elapsed", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const wakeAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: wakeAt,
-              parentStepId: null
-            });
-            context.handleSleepStepEvent(createSleepStepId("sleep-1"), { type: "elapsed" });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "sleep_waiting",
-                stepId: "sleep-1",
-                wakeAt: wakeAt,
-                recordedAt: expect.any(Date)
-              },
-              {
-                type: "sleep_elapsed",
-                stepId: "sleep-1",
-                recordedAt: expect.any(Date)
-              }
-            ]);
           });
         });
 
@@ -2388,9 +2179,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            expect(() => context.handleSleepStepEvent(createSleepStepId("nonexistent"), { type: "elapsed" })).toThrow(
-              /not found/
-            );
+            expect(() => context.handleSleepStepElapsed(createSleepStepId("nonexistent"))).toThrow(/not found/);
           });
         });
 
@@ -2398,13 +2187,12 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createSleepStepId("sleep-1"), {
-              type: "sleep",
-              wakeAt: new Date(),
+            context.getOrCreateSleepStep(createSleepStepId("sleep-1"), {
+              wakeAt: new Date(Date.now() + 60_000),
               parentStepId: null
             });
-            context.handleSleepStepEvent(createSleepStepId("sleep-1"), { type: "elapsed" });
-            expect(() => context.handleSleepStepEvent(createSleepStepId("sleep-1"), { type: "elapsed" })).toThrow(
+            context.handleSleepStepElapsed(createSleepStepId("sleep-1"));
+            expect(() => context.handleSleepStepElapsed(createSleepStepId("sleep-1"))).toThrow(
               /Expected 'waiting' but got elapsed/
             );
           });
@@ -2413,13 +2201,12 @@ describe("WorkflowRuntime", () => {
     });
 
     describe("wait steps", () => {
-      describe("getOrCreateStep()", () => {
+      describe("getOrCreateWaitStep()", () => {
         it("creates a wait step when no timeout is provided", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const step = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            const step = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null
             });
@@ -2437,42 +2224,18 @@ describe("WorkflowRuntime", () => {
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
             const timeoutAt = new Date(Date.now() + 60_000);
-            const step = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            const step = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null,
-              timeoutAt: timeoutAt
+              timeoutAt
             });
             expect(step).toMatchObject({
               id: "wait-1",
               type: "wait",
               state: "waiting",
               eventName: "event-1",
-              timeoutAt: timeoutAt
+              timeoutAt
             });
-          });
-        });
-
-        it("writes a 'wait_waiting' step event", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const timeoutAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: timeoutAt
-            });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "wait_waiting",
-                stepId: "wait-1",
-                eventName: "event-1",
-                timeoutAt: timeoutAt,
-                recordedAt: expect.any(Date)
-              }
-            ]);
           });
         });
 
@@ -2480,328 +2243,112 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const first = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            const first = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: new Date(Date.now() + 60_000)
+              parentStepId: null
             });
-            const second = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            const second = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: new Date(Date.now() + 60_000)
+              parentStepId: null
             });
             expect(first).toEqual(second);
           });
         });
 
-        it("schedules an alarm when a timeout is provided", async () => {
+        it("does not set a durable object alarm by itself", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const timeoutAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null,
-              timeoutAt: timeoutAt
-            });
-            expect(await state.storage.getAlarm()).toBe(timeoutAt.getTime());
-          });
-        });
-
-        it("replaces any existing alarm with a new alarm when a timeout is provided", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            await state.storage.setAlarm(Date.now() + 999_999);
-
-            const context = new WorkflowRuntimeContext(state.storage);
-            const timeoutAt = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: timeoutAt
-            });
-            expect(await state.storage.getAlarm()).toBe(timeoutAt.getTime());
-          });
-        });
-
-        it("doesn't schedule an alarm when no timeout is provided", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
+              timeoutAt: new Date(Date.now() + 60_000)
             });
             expect(await state.storage.getAlarm()).toBeNull();
           });
         });
 
-        it("uses the stored timeout_at for the alarm, not the caller-provided timeoutAt", async () => {
+        it("leaves an existing alarm unchanged when creating a wait step with timeout", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const prior = Date.now() + 999_999;
+            await state.storage.setAlarm(prior);
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
+              eventName: "event-1",
+              parentStepId: null,
+              timeoutAt: new Date(Date.now() + 60_000)
+            });
+            expect(await state.storage.getAlarm()).toBe(prior);
+          });
+        });
+
+        it("satisfies from a queued inbound event when creating the wait step", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const originalTimeout = new Date(Date.now() + 60_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: originalTimeout
-            });
-            await state.storage.deleteAlarm();
-
-            const shiftedTimeout = new Date(Date.now() + 120_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: shiftedTimeout
-            });
-            expect(await state.storage.getAlarm()).toBe(originalTimeout.getTime());
-          });
-        });
-
-        it("does not schedule an alarm when an existing wait step has a past timeout_at", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const pastTimeout = new Date(Date.now() - 10_000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: pastTimeout
-            });
-            await state.storage.deleteAlarm();
-
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: pastTimeout
-            });
-            expect(await state.storage.getAlarm()).toBeNull();
-          });
-        });
-      });
-
-      describe("handleInboundEvent()", () => {
-        it("moves a wait step from 'waiting' to 'satisfied' when event is delivered", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            await instance.handleInboundEvent("event-1", "payload");
-            const updatedStep = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            expect(updatedStep).toMatchObject({
-              state: "satisfied",
-              payload: JSON.stringify("payload"),
-              resolvedAt: expect.any(Date)
-            });
-          });
-        });
-
-        it("writes a 'wait_satisfied' step event when a wait step is satisfied", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            await instance.handleInboundEvent("event-1", "payload");
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "wait_waiting",
-                stepId: "wait-1",
-                eventName: "event-1",
-                recordedAt: expect.any(Date)
-              },
-              {
-                type: "wait_satisfied",
-                stepId: "wait-1",
-                payload: JSON.stringify("payload"),
-                recordedAt: expect.any(Date)
-              }
-            ]);
-          });
-        });
-
-        it("queues the event when no matching wait step exists", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            await instance.handleInboundEvent("event-1", "queued-payload");
-            const context = new WorkflowRuntimeContext(state.storage);
-            const step = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            state.storage.sql.exec(
+              `INSERT INTO inbound_events (event_name, payload) VALUES (?, ?)`,
+              "event-1",
+              JSON.stringify({ v: 1 })
+            );
+            const step = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null
             });
             expect(step).toMatchObject({
               state: "satisfied",
-              payload: JSON.stringify("queued-payload")
+              payload: { v: 1 }
             });
           });
         });
 
-        it("consumes queued inbound events in FIFO order when several waits are created", async () => {
+        it("rejects a second inbound_events row with the same claimed_by", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            await instance.handleInboundEvent("event-1", "first");
-            // Distinct `created_at` so FIFO ordering does not depend on random `inbound_events.id` when timestamps tie.
-            await new Promise((r) => setTimeout(r, 2));
-            await instance.handleInboundEvent("event-1", "second");
+          await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            const step1 = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null
             });
-            const step2 = await context.getOrCreateStep(createWaitStepId("wait-2"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            expect(step1).toMatchObject({
-              state: "satisfied",
-              payload: JSON.stringify("first")
-            });
-            expect(step2).toMatchObject({
-              state: "satisfied",
-              payload: JSON.stringify("second")
-            });
+            const t = Date.now();
+            state.storage.sql.exec(
+              `INSERT INTO inbound_events (event_name, payload, claimed_by, claimed_at) VALUES (?, ?, ?, ?)`,
+              "event-1",
+              null,
+              "wait-1",
+              t
+            );
+            expect(() =>
+              state.storage.sql.exec(
+                `INSERT INTO inbound_events (event_name, payload, claimed_by, claimed_at) VALUES (?, ?, ?, ?)`,
+                "event-1",
+                null,
+                "wait-1",
+                t + 1
+              )
+            ).toThrow(/UNIQUE/);
           });
-        });
-
-        it("satisfies the earliest matching wait step when multiple are waiting", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            await context.getOrCreateStep(createWaitStepId("wait-2"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            await instance.handleInboundEvent("event-1", "payload");
-            const step1 = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            const step2 = await context.getOrCreateStep(createWaitStepId("wait-2"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null
-            });
-            expect(step1).toMatchObject({
-              state: "satisfied",
-              payload: JSON.stringify("payload")
-            });
-            expect(step2).toMatchObject({ state: "waiting" });
-          });
-        });
-
-        it("does not change steps when the workflow is terminal", async () => {
-          const executeSpy = vi
-            .spyOn(TestWorkflowDefinition.prototype, "execute")
-            .mockImplementation(async function (this: TestWorkflowDefinition) {
-              await this.run("step-1", async () => 1);
-            });
-          try {
-            const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-            await runInDurableObject(stub, async (instance) => {
-              const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-              instance.onStatusChange_experimental = async (status) => {
-                if (status === "running") return;
-                resolve(status);
-              };
-              await instance.create({ definitionVersion: "2026-03-19" });
-              await expect(promise).resolves.toBe("completed");
-
-              const stepsBefore = instance.getSteps_experimental();
-              const eventsBefore = instance.getStepEvents_experimental();
-
-              await instance.handleInboundEvent("event-1", { ignored: true });
-
-              expect(instance.getSteps_experimental()).toEqual(stepsBefore);
-              expect(instance.getStepEvents_experimental()).toEqual(eventsBefore);
-            });
-          } finally {
-            executeSpy.mockRestore();
-          }
         });
       });
 
-      describe("handleWaitStepEvent({ type: 'timed_out' })", () => {
+      describe("handleWaitStepTimedOut()", () => {
         it("moves a wait step from 'waiting' to 'timed_out'", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
             const timeoutAt = new Date(Date.now() - 1000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null,
-              timeoutAt: timeoutAt
+              timeoutAt
             });
-            context.handleWaitStepEvent(createWaitStepId("wait-1"), { type: "timed_out" });
-            const updatedStep = await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            context.handleWaitStepTimedOut(createWaitStepId("wait-1"));
+            const step = context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: timeoutAt
+              parentStepId: null
             });
-            expect(updatedStep).toMatchObject({
-              state: "timed_out",
-              resolvedAt: expect.any(Date)
-            });
-          });
-        });
-
-        it("writes a 'wait_timed_out' step event when a wait step is timed out", async () => {
-          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const timeoutAt = new Date(Date.now() - 1000);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
-              eventName: "event-1",
-              parentStepId: null,
-              timeoutAt: timeoutAt
-            });
-            context.handleWaitStepEvent(createWaitStepId("wait-1"), { type: "timed_out" });
-            expect(await instance.getStepEvents_experimental()).toMatchObject([
-              {
-                type: "wait_waiting",
-                stepId: "wait-1",
-                eventName: "event-1",
-                timeoutAt: timeoutAt,
-                recordedAt: expect.any(Date)
-              },
-              {
-                type: "wait_timed_out",
-                stepId: "wait-1",
-                recordedAt: expect.any(Date)
-              }
-            ]);
+            expect(step).toMatchObject({ state: "timed_out" });
           });
         });
 
@@ -2809,9 +2356,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            expect(() => context.handleWaitStepEvent(createWaitStepId("nonexistent"), { type: "timed_out" })).toThrow(
-              /not found/
-            );
+            expect(() => context.handleWaitStepTimedOut(createWaitStepId("nonexistent"))).toThrow(/not found/);
           });
         });
 
@@ -2819,14 +2364,13 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (_instance, state) => {
             const context = new WorkflowRuntimeContext(state.storage);
-            await context.getOrCreateStep(createWaitStepId("wait-1"), {
-              type: "wait",
+            context.getOrCreateWaitStep(createWaitStepId("wait-1"), {
               eventName: "event-1",
               parentStepId: null,
               timeoutAt: new Date(Date.now() - 1000)
             });
-            context.handleWaitStepEvent(createWaitStepId("wait-1"), { type: "timed_out" });
-            expect(() => context.handleWaitStepEvent(createWaitStepId("wait-1"), { type: "timed_out" })).toThrow(
+            context.handleWaitStepTimedOut(createWaitStepId("wait-1"));
+            expect(() => context.handleWaitStepTimedOut(createWaitStepId("wait-1"))).toThrow(
               /Expected 'waiting' but got timed_out/
             );
           });

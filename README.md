@@ -88,7 +88,22 @@ export default {
 } satisfies ExportedHandler<Env>;
 ```
 
-Workflow input is **`this.ctx.props.input`**, populated from **`create({ input })`**. Use a **stable `definitionVersion`** string per deploy you want long-running instances to keep using; add a new version in **`getDefinition`** when you ship breaking definition changes.
+Workflow input is **`this.ctx.props.input`**, populated from **`create({ input })`**. The runtime also sets **`this.ctx.props.requestId`** (a new UUID each time the run loop invokes your definition) and **`this.ctx.props.runtimeInstanceId`** (this Durable Object’s id) for logs and correlation. Use a **stable `definitionVersion`** string per deploy you want long-running instances to keep using; add a new version in **`getDefinition`** when you ship breaking definition changes.
+
+### Runtime control
+
+From the Durable Object stub you can:
+
+- **`create({ definitionVersion, input? })`** — Pins the version and optional input in SQLite the **first** time the instance is initialized, then starts execution. **No-op** if the workflow is already **completed**, **failed**, **cancelled**, or **paused**. Throws if the object was already pinned to a **different** version.
+- **`pause()`** — When status is **running**, moves to **paused**, clears alarms, and stops driving **`execute()`** until **`resume()`**. Inbound events are queued and applied when a matching **`wait`** runs again after resume.
+- **`resume()`** — When status is **paused**, moves to **running** and continues the loop. Throws if the workflow is not paused.
+- **`cancel(reason?)`** — Moves to terminal **cancelled** and clears alarms.
+
+New instances start in **`pending`** until the first transition to **`running`**.
+
+### Experimental introspection
+
+For dashboards and debugging, the runtime exposes **`getSteps_experimental()`** and **`getWorkflowEvents_experimental()`**. The optional lifecycle hook is **`onStatusChange_experimental`** (see [Keeping workflow execution separate from state projection](#keeping-workflow-execution-separate-from-state-projection)). These names are marked experimental because they may change as the API hardens.
 
 ## How it works
 
@@ -102,17 +117,21 @@ The library separates concerns into two main layers:
 
 Each time the runtime advances, it calls `next()` on your `WorkflowDefinition`, which **runs `execute()` from the beginning again**. Steps that have already completed durably (`run`, elapsed `sleep`, resolved `wait`, and so on) **replay from stored state**: their callbacks are not re-invoked, and recorded results are returned as-is. New side effects happen only when the engine reaches a step that is not yet complete and the durable state allows that transition.
 
+**Step ids must be unique** within one top-level **`execute()`** run (the same **`next()`** invocation): reuse the same id across **`run`**, **`sleep`**, or **`wait`** and the workflow fails fast.
+
+**Sibling `run` calls.** At a given nesting level, after one **`run`** finishes successfully in the same **`next()`**, the next sibling **`run`** forces the runtime to **run the loop again immediately** (you still replay from the top; completed steps stay cached). For linear workflows this is invisible; if you place several **`run`** calls back-to-back at the same depth, expect an extra loop hop per step after the first. Nested **`run`** callbacks get a fresh frame, so children do not consume the parent’s sibling budget.
+
 ### When the loop runs and when it stops
 
 The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invokes `next()` until one of these happens:
 
-- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`). The loop exits and the watchdog alarm is cleared.
+- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared.
 - **Immediate resume**: `next()` asks to **continue immediately** (for example, so another step in the same logical “tick” can run). The loop continues without leaving the Durable Object invocation.
 - **Suspended**: `next()` asks to **suspend**—for example, a step is waiting on a **retry backoff**, a **sleep** until a future time, or a **wait** for an inbound event. The loop exits; the runtime relies on **alarms** and/or **incoming events** to call back into the run loop. A long **watchdog alarm** also exists as a safety net if progress stalls.
 
 ### Step kinds
 
-- **`run`**: A named, durable unit of work. Outcomes are persisted; failures can be **retried** with backoff up to a configured maximum number of attempts.
+- **`run`**: A named, durable unit of work. Callbacks return JSON-serializable values or `undefined`. Outcomes are persisted; failures can be **retried** with backoff up to **`maxAttempts`** (default **3** attempts per step unless you pass `{ maxAttempts: n }`).
 - **`sleep`**: Pauses until a **scheduled wake time** stored in SQLite; the Durable Object is woken by an **alarm** when that time is reached.
 - **`wait`**: Pauses until a matching **inbound event** (by name) or an optional **timeout**. Resolution is recorded in durable state so replay does not double-apply the branch that handled the event.
 
@@ -159,7 +178,7 @@ const payment = await this.wait<{ chargeId: string }>("capture-payment", "paymen
 
 #### The watchdog alarm
 
-In addition to these precise alarms, the runtime sets a **30-minute watchdog alarm at the start of every run-loop iteration**, before delegating to the workflow definition. When an iteration completes normally whether the workflow finishes, suspends on a sleep, or suspends on a wait - that alarm is either deleted or overwritten with the more specific alarm for the next resumption point. The watchdog only fires if something goes wrong in the middle.
+In addition to these precise alarms, the runtime sets a **30-minute watchdog alarm at the start of every run-loop iteration**, before delegating to the workflow definition. When an iteration ends cleanly—workflow terminal completion, suspend with a known **`wakeAt`**, or suspend waiting only on inbound events—the alarm is **cleared** or **replaced** by the next wake time when there is one. A **`wait`** with **no** `timeoutAt` has no step-specific alarm until an event arrives; the watchdog remains the backstop. The watchdog only fires if something goes wrong in the middle.
 
 The problem it guards against is a `run` step that gets stuck in the `running` state. Before the user's callback executes, the runtime durably writes `state = 'running'` to SQLite. That write is intentional: it ensures that a later replay does not try to start a second concurrent attempt for the same step. But it creates a gap:
 
@@ -176,7 +195,7 @@ There is also a guard for the case where an alarm fires while the run loop is al
 
 ### Versioning
 
-`create({ definitionVersion, input })` **pins** the definition version and input in SQLite the first time the instance is initialized. **The version cannot be changed later** for that Durable Object id; attempting a different version throws. Every subsequent `next()` resolves the worker implementation via **`getDefinition(version)`** using that pinned value, so **long-lived workflows keep running the definition lineage they started with**, while new instances can use newer version strings you add to `getDefinition`.
+`create({ definitionVersion, input })` **pins** the definition version and optional input in SQLite the first time the instance is initialized (see [Runtime control](#runtime-control) for no-op cases). **The version cannot be changed later** for that Durable Object id; attempting a different version throws. Every subsequent `next()` resolves the worker implementation via **`getDefinition(version)`** using that pinned value, so **long-lived workflows keep running the definition lineage they started with**, while new instances can use newer version strings you add to `getDefinition`.
 
 ## Why this exists
 
@@ -190,9 +209,9 @@ Cloudflare Workflows is a strong managed option, and for many use cases it is th
 
 ### Versioning workflow definitions
 
-One of the biggest concerns in long-running workflows is definition drift. A normal Worker request is typically bound to a single in-flight execution on one deployed version, but a Workflow is durable: it persists state and resumes across multiple executions over time. A workflow begin executing on version of its definition and resume later after a new deploy has changed or removed a step. That means the next invocation of the workflow entry point could repeat steps unsafely or leave the runtime in an invalid state.
+One of the biggest concerns in long-running workflows is definition drift. A normal Worker request is typically bound to a single in-flight execution on one deployed version, but a Workflow is durable: it persists state and resumes across multiple executions over time. A workflow may start on one version of its definition and resume later after a deploy has changed or removed a step. That means the next invocation of the workflow entry point could repeat steps unsafely or leave the runtime in an invalid state.
 
-Versioning does not eliminate these problems, but it makes the risk explicit. It forces you to think about compatibility, migration, and long-lived execution up front. Cloudflare Workflows can support version-aware workflows by passing a version token in the immutable per-instance parameters and branching in workflow code or by maintianing a version mapping in an external database, but both are conventions that your application is responsible for maintaining.
+Versioning does not eliminate these problems, but it makes the risk explicit. It forces you to think about compatibility, migration, and long-lived execution up front. Cloudflare Workflows can support version-aware workflows by passing a version token in the immutable per-instance parameters and branching in workflow code or by maintaining a version mapping in an external database, but both are conventions that your application is responsible for maintaining.
 
 `workerflow` takes a different approach: the runtime pins a definition version when the instance is created and resolves future execution against that pinned version. The goal is not to make compatibility problems disappear, but to make the version boundary explicit in the runtime rather than implicit in workflow input and application code.
 
@@ -222,12 +241,15 @@ export class MyWorkflow extends WorkflowEntrypoint {
 
 This looks reasonable at first, but it creates an important failure-mode problem. If the actual business steps all succeed, but the final “sync success” step fails, then the workflow as a whole is now treated as failed. At that point, workflow execution and application-state projection have become tightly coupled, even though they are not really the same concern.
 
-I think a cleaner design is to keep synchronization logic out of workflow steps entirely. Instead, the runtime can expose lifecycle hooks that fire when workflow state changes, and synchronization can happen there.
+I think a cleaner design is to keep synchronization logic out of workflow steps entirely. Instead, the runtime can expose a lifecycle hook that fires when workflow status changes, and synchronization can happen there.
 
 ```ts
 export class MyWorkflowRuntime extends WorkflowRuntime {
-  onStatusChange(status) {
-    // Update your database, or push to a queue for streaming
+  async onStatusChange_experimental(
+    status: "running" | "paused" | "completed" | "failed" | "cancelled"
+  ) {
+    // Update your database, or push to a queue for streaming.
+    // Note: the hook is also invoked with "running" when leaving pending/paused into running.
   }
 }
 ```

@@ -22,7 +22,7 @@ export default `
 
     CHECK (updated_at >= created_at),
 
-    -- definition_version and definition_input must be set together or not set at all
+    -- definition_input must be NULL if definition_version is NULL
     CHECK (definition_version IS NOT NULL OR definition_input IS NULL),
 
     -- definition must be pinned before running/paused/completing/failing; cancelled is always allowed
@@ -32,348 +32,157 @@ export default `
   CREATE TABLE steps (
     id TEXT NOT NULL PRIMARY KEY CHECK (length(id) > 0),
     type TEXT NOT NULL CHECK (type IN ('run', 'sleep', 'wait')),
-    state TEXT NOT NULL CHECK (state IN (
-      'pending',
-      'running',
-      'succeeded',
-      'failed',
+    created_at INTEGER NOT NULL
+      DEFAULT (CAST(unixepoch('subsecond') * 1000 AS INTEGER))
+      CHECK (created_at >= 0),
+
+    -- sleep / wait only: run rows use run_step_attempts for lifecycle
+    state TEXT CHECK (state IN (
       'waiting',
       'elapsed',
       'satisfied',
       'timed_out'
     )),
-    created_at INTEGER NOT NULL
-      DEFAULT (CAST(unixepoch('subsecond') * 1000 AS INTEGER))
-      CHECK (created_at >= 0),
 
-    -- run-step fields
-    attempt_count INTEGER,
     max_attempts INTEGER,
-    next_attempt_at INTEGER,
-    result TEXT,
-    error_message TEXT,
-    error_name TEXT,
 
-    -- sleep-step fields
-    wake_at INTEGER,
+    target_wake_at INTEGER,
 
-    -- wait-step fields
     event_name TEXT,
     timeout_at INTEGER,
-    payload TEXT,
 
-    -- terminal timestamp
     resolved_at INTEGER,
 
-    -- innermost enclosing run step when this row was created (nested run / sleep / wait under a run callback)
     parent_step_id TEXT REFERENCES steps(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
 
-    CHECK (attempt_count IS NULL OR attempt_count >= 0),
     CHECK (max_attempts IS NULL OR max_attempts >= 1),
-    CHECK (next_attempt_at IS NULL OR next_attempt_at >= 0),
-    CHECK (wake_at IS NULL OR wake_at >= 0),
+    CHECK (target_wake_at IS NULL OR target_wake_at >= 0),
     CHECK (timeout_at IS NULL OR timeout_at >= 0),
     CHECK (resolved_at IS NULL OR resolved_at >= created_at),
-    CHECK (error_name IS NULL OR length(error_name) > 0),
     CHECK (event_name IS NULL OR length(event_name) > 0),
 
-    -- run steps may never exceed max_attempts
-    CHECK (
-      attempt_count IS NULL OR
-      max_attempts IS NULL OR
-      attempt_count <= max_attempts
-    ),
-
     CHECK (
       (
         type = 'run' AND
-        state = 'pending' AND
-        attempt_count IS NOT NULL AND attempt_count >= 0 AND
+        state IS NULL AND
         (max_attempts IS NULL OR max_attempts >= 1) AND
-        (max_attempts IS NULL OR attempt_count < max_attempts) AND
-        next_attempt_at IS NOT NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
+        target_wake_at IS NULL AND
         event_name IS NULL AND
         timeout_at IS NULL AND
-        payload IS NULL AND
         resolved_at IS NULL
-      )
-      OR
-      (
-        type = 'run' AND
-        state = 'running' AND
-        attempt_count IS NOT NULL AND attempt_count >= 1 AND
-        (max_attempts IS NULL OR max_attempts >= 1) AND
-        (max_attempts IS NULL OR attempt_count <= max_attempts) AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL AND
-        resolved_at IS NULL
-      )
-      OR
-      (
-        type = 'run' AND
-        state = 'succeeded' AND
-        attempt_count IS NOT NULL AND attempt_count >= 1 AND
-        (max_attempts IS NULL OR max_attempts >= 1) AND
-        (max_attempts IS NULL OR attempt_count <= max_attempts) AND
-        next_attempt_at IS NULL AND
-        result IS NOT NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL AND
-        resolved_at IS NOT NULL
-      )
-      OR
-      (
-        type = 'run' AND
-        state = 'failed' AND
-        attempt_count IS NOT NULL AND attempt_count >= 1 AND
-        (max_attempts IS NULL OR max_attempts >= 1) AND
-        (max_attempts IS NULL OR attempt_count <= max_attempts) AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NOT NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL AND
-        resolved_at IS NOT NULL
       )
       OR
       (
         type = 'sleep' AND
         state = 'waiting' AND
-        attempt_count IS NULL AND
         max_attempts IS NULL AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NOT NULL AND
+        target_wake_at IS NOT NULL AND
         event_name IS NULL AND
         timeout_at IS NULL AND
-        payload IS NULL AND
         resolved_at IS NULL
       )
       OR
       (
         type = 'sleep' AND
         state = 'elapsed' AND
-        attempt_count IS NULL AND
         max_attempts IS NULL AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
+        target_wake_at IS NOT NULL AND
         event_name IS NULL AND
         timeout_at IS NULL AND
-        payload IS NULL AND
         resolved_at IS NOT NULL
       )
       OR
       (
         type = 'wait' AND
         state = 'waiting' AND
-        attempt_count IS NULL AND
         max_attempts IS NULL AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
+        target_wake_at IS NULL AND
         event_name IS NOT NULL AND
-        payload IS NULL AND
         resolved_at IS NULL
       )
       OR
       (
         type = 'wait' AND
         state = 'satisfied' AND
-        attempt_count IS NULL AND
         max_attempts IS NULL AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
+        target_wake_at IS NULL AND
         event_name IS NOT NULL AND
-        timeout_at IS NULL AND
-        payload IS NOT NULL AND
         resolved_at IS NOT NULL
       )
       OR
       (
         type = 'wait' AND
         state = 'timed_out' AND
-        attempt_count IS NULL AND
         max_attempts IS NULL AND
-        next_attempt_at IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        wake_at IS NULL AND
+        target_wake_at IS NULL AND
         event_name IS NOT NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL AND
+        timeout_at IS NOT NULL AND
         resolved_at IS NOT NULL
       )
     ),
     CHECK (parent_step_id IS NULL OR parent_step_id <> id)
   ) STRICT;
 
-  CREATE TABLE step_events (
+  CREATE TABLE run_step_attempts (
     id TEXT NOT NULL PRIMARY KEY
       DEFAULT (lower(hex(randomblob(16))))
       CHECK (length(id) > 0),
 
-    step_id TEXT NOT NULL,
-    recorded_at INTEGER NOT NULL
+    step_id TEXT NOT NULL REFERENCES steps(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
+
+    started_at INTEGER NOT NULL
       DEFAULT (CAST(unixepoch('subsecond') * 1000 AS INTEGER))
-      CHECK (recorded_at >= 0),
+      CHECK (started_at >= 0),
 
-    type TEXT NOT NULL CHECK (type IN (
-      'attempt_started',
-      'attempt_succeeded',
-      'attempt_failed',
-      'sleep_waiting',
-      'sleep_elapsed',
-      'wait_waiting',
-      'wait_satisfied',
-      'wait_timed_out'
-    )),
+    state TEXT NOT NULL CHECK (state IN ('started', 'succeeded', 'failed')),
 
-    attempt_number INTEGER,
-    result TEXT,
+    ended_at INTEGER CHECK (ended_at IS NULL OR ended_at >= started_at),
+
+    -- Discriminator for the shape of a succeeded result.
+    --   'json'   → result_json holds the raw JSON value (never NULL)
+    --   'none'   → callback returned undefined/void, result_json IS NULL
+    result_type TEXT CHECK (result_type IN ('json', 'none')),
+
+    -- Raw JSON value. No wrapper objects.
+    -- NULL when result_type is 'none', or when the attempt hasn't succeeded yet.
+    result_json TEXT CHECK (result_json IS NULL OR json_valid(result_json)),
+
     error_message TEXT,
     error_name TEXT,
-    next_attempt_at INTEGER,
-    wake_at INTEGER,
-    event_name TEXT,
-    timeout_at INTEGER,
-    payload TEXT,
+    next_attempt_at INTEGER CHECK (next_attempt_at IS NULL OR next_attempt_at >= 0),
 
-    FOREIGN KEY (step_id) REFERENCES steps(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
-
-    CHECK (attempt_number IS NULL OR attempt_number >= 1),
-    CHECK (next_attempt_at IS NULL OR next_attempt_at >= 0),
-    CHECK (wake_at IS NULL OR wake_at >= 0),
-    CHECK (timeout_at IS NULL OR timeout_at >= 0),
     CHECK (error_name IS NULL OR length(error_name) > 0),
-    CHECK (event_name IS NULL OR length(event_name) > 0),
 
     CHECK (
       (
-        type = 'attempt_started' AND
-        attempt_number IS NOT NULL AND
-        result IS NULL AND
+        state = 'started' AND
+        ended_at IS NULL AND
+        result_type IS NULL AND
+        result_json IS NULL AND
         error_message IS NULL AND
         error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
+        next_attempt_at IS NULL
       )
       OR
       (
-        type = 'attempt_succeeded' AND
-        attempt_number IS NOT NULL AND
-        result IS NOT NULL AND
+        state = 'succeeded' AND
+        ended_at IS NOT NULL AND
+        result_type IS NOT NULL AND
+        (
+          (result_type = 'none' AND result_json IS NULL) OR
+          (result_type = 'json' AND result_json IS NOT NULL)
+        ) AND
         error_message IS NULL AND
         error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
+        next_attempt_at IS NULL
       )
       OR
       (
-        type = 'attempt_failed' AND
-        attempt_number IS NOT NULL AND
-        result IS NULL AND
+        state = 'failed' AND
+        ended_at IS NOT NULL AND
         error_message IS NOT NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
-      )
-      OR
-      (
-        type = 'sleep_waiting' AND
-        attempt_number IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NOT NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
-      )
-      OR
-      (
-        type = 'sleep_elapsed' AND
-        attempt_number IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
-      )
-      OR
-      (
-        type = 'wait_waiting' AND
-        attempt_number IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NOT NULL AND
-        payload IS NULL
-      )
-      OR
-      (
-        type = 'wait_satisfied' AND
-        attempt_number IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NOT NULL
-      )
-      OR
-      (
-        type = 'wait_timed_out' AND
-        attempt_number IS NULL AND
-        result IS NULL AND
-        error_message IS NULL AND
-        error_name IS NULL AND
-        next_attempt_at IS NULL AND
-        wake_at IS NULL AND
-        event_name IS NULL AND
-        timeout_at IS NULL AND
-        payload IS NULL
+        result_type IS NULL AND
+        result_json IS NULL
       )
     )
   ) STRICT;
@@ -405,6 +214,8 @@ export default `
       DEFAULT (lower(hex(randomblob(16))))
       CHECK (length(id) > 0),
     event_name TEXT NOT NULL CHECK (length(event_name) > 0),
+    -- Raw JSON value, or SQL NULL when no payload was provided (undefined).
+    -- JSON null is stored as the TEXT literal 'null', distinct from SQL NULL.
     payload TEXT CHECK (payload IS NULL OR json_valid(payload)),
     created_at INTEGER NOT NULL
       DEFAULT (CAST(unixepoch('subsecond') * 1000 AS INTEGER))
@@ -414,20 +225,21 @@ export default `
 
     FOREIGN KEY (claimed_by) REFERENCES steps(id) ON UPDATE RESTRICT ON DELETE RESTRICT,
 
-    -- claimed_by and claimed_at must be set together or not set at all
     CHECK (
       (claimed_by IS NULL AND claimed_at IS NULL) OR
       (claimed_by IS NOT NULL AND claimed_at IS NOT NULL)
     )
   ) STRICT;
 
-  -- scheduler/query indexes
-  CREATE INDEX steps_run_pending_by_time_idx
-    ON steps(next_attempt_at, id)
-    WHERE type = 'run' AND state = 'pending';
+  CREATE INDEX run_step_attempts_by_step_time_idx
+    ON run_step_attempts(step_id, started_at, id);
+
+  CREATE INDEX run_step_attempts_started_one_idx
+    ON run_step_attempts(step_id)
+    WHERE state = 'started';
 
   CREATE INDEX steps_sleep_waiting_by_time_idx
-    ON steps(wake_at, id)
+    ON steps(target_wake_at, id)
     WHERE type = 'sleep' AND state = 'waiting';
 
   CREATE INDEX steps_wait_waiting_by_event_idx
@@ -442,20 +254,16 @@ export default `
     ON steps(parent_step_id, id)
     WHERE parent_step_id IS NOT NULL;
 
-  CREATE INDEX step_events_by_step_and_time_idx
-    ON step_events(step_id, recorded_at, id);
-
   CREATE INDEX workflow_events_by_time_idx
     ON workflow_events(recorded_at, id);
 
   CREATE INDEX inbound_events_by_name_and_time_idx
     ON inbound_events(event_name, created_at, id);
 
-  CREATE INDEX inbound_events_by_claimed_by_idx
-    ON inbound_events(claimed_by, id)
+  CREATE UNIQUE INDEX inbound_events_claimed_by_unique
+    ON inbound_events(claimed_by)
     WHERE claimed_by IS NOT NULL;
 
-  -- immutable identity fields
   CREATE TRIGGER workflow_metadata_immutable_fields
   BEFORE UPDATE ON workflow_metadata
   FOR EACH ROW
@@ -464,7 +272,6 @@ export default `
     SELECT RAISE(ABORT, 'workflow_metadata.id and workflow_metadata.created_at are immutable');
   END;
 
-  -- valid status transitions
   CREATE TRIGGER workflow_metadata_valid_transition
   BEFORE UPDATE ON workflow_metadata
   FOR EACH ROW
@@ -507,22 +314,34 @@ export default `
     SELECT RAISE(ABORT, 'steps.parent_step_id must reference a run step');
   END;
 
-  -- append-only step events
-  CREATE TRIGGER step_events_append_only_update
-  BEFORE UPDATE ON step_events
-  FOR EACH ROW
+  CREATE TRIGGER run_step_attempts_step_must_be_run
+  BEFORE INSERT ON run_step_attempts
+  WHEN (SELECT type FROM steps WHERE id = NEW.step_id) IS NOT 'run'
   BEGIN
-    SELECT RAISE(ABORT, 'step_events is append-only');
+    SELECT RAISE(ABORT, 'run_step_attempts.step_id must reference a run step');
   END;
 
-  CREATE TRIGGER step_events_append_only_delete
-  BEFORE DELETE ON step_events
-  FOR EACH ROW
+  CREATE TRIGGER run_step_attempts_at_most_one_started_ins
+  BEFORE INSERT ON run_step_attempts
+  WHEN NEW.state = 'started'
+    AND EXISTS (SELECT 1 FROM run_step_attempts WHERE step_id = NEW.step_id AND state = 'started')
   BEGIN
-    SELECT RAISE(ABORT, 'step_events is append-only');
+    SELECT RAISE(ABORT, 'run step already has an in-flight attempt');
   END;
 
-  -- append-only workflow events
+  CREATE TRIGGER run_step_attempts_valid_transition
+  BEFORE UPDATE ON run_step_attempts
+  FOR EACH ROW
+  WHEN NEW.state <> OLD.state
+  BEGIN
+    SELECT CASE
+      WHEN OLD.state = 'started' AND NEW.state NOT IN ('succeeded', 'failed') THEN
+        RAISE(ABORT, 'started can only transition to succeeded or failed')
+      WHEN OLD.state IN ('succeeded', 'failed') THEN
+        RAISE(ABORT, 'terminal attempt state cannot transition')
+    END;
+  END;
+
   CREATE TRIGGER workflow_events_append_only_update
   BEFORE UPDATE ON workflow_events
   FOR EACH ROW
@@ -535,25 +354,5 @@ export default `
   FOR EACH ROW
   BEGIN
     SELECT RAISE(ABORT, 'workflow_events is append-only');
-  END;
-
-  -- step_events.type must match the referenced row in steps.type
-  CREATE TRIGGER step_events_parent_type_match
-  BEFORE INSERT ON step_events
-  FOR EACH ROW
-  BEGIN
-    SELECT CASE
-      WHEN NOT EXISTS (SELECT 1 FROM steps WHERE id = NEW.step_id) THEN
-        RAISE(ABORT, 'step_events.step_id does not reference an existing steps row')
-      WHEN NEW.type IN ('attempt_started', 'attempt_succeeded', 'attempt_failed')
-           AND (SELECT type FROM steps WHERE id = NEW.step_id) <> 'run' THEN
-        RAISE(ABORT, 'run attempt events require a run step')
-      WHEN NEW.type IN ('sleep_waiting', 'sleep_elapsed')
-           AND (SELECT type FROM steps WHERE id = NEW.step_id) <> 'sleep' THEN
-        RAISE(ABORT, 'sleep events require a sleep step')
-      WHEN NEW.type IN ('wait_waiting', 'wait_satisfied', 'wait_timed_out')
-           AND (SELECT type FROM steps WHERE id = NEW.step_id) <> 'wait' THEN
-        RAISE(ABORT, 'wait events require a wait step')
-    END;
   END;
 `;
