@@ -131,9 +131,34 @@ The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invok
 
 ### Step kinds
 
-- **`run`**: A named, durable unit of work. Callbacks return JSON-serializable values or `undefined`. Outcomes are persisted; failures can be **retried** with backoff up to **`maxAttempts`** (default **3** attempts per step unless you pass `{ maxAttempts: n }`).
+- **`run`**: A named, durable unit of work. Callbacks can return JSON, `undefined`, or a `ReadableStream<Uint8Array>`. Outcomes are persisted; failures can be **retried** with backoff up to **`maxAttempts`** (default **3** attempts per step unless you pass `{ maxAttempts: n }`).
 - **`sleep`**: Pauses until a **scheduled wake time** stored in SQLite; the Durable Object is woken by an **alarm** when that time is reached.
 - **`wait`**: Pauses until a matching **inbound event** (by name) or an optional **timeout**. Resolution is recorded in durable state so replay does not double-apply the branch that handled the event.
+
+### ReadableStream support in `run()`
+
+The `run()` method supports returning a `ReadableStream<Uint8Array>` in addition to JSON and `undefined`. This lets workflow steps produce binary or streamed data while preserving the same durable replay guarantees as JSON results.
+
+```ts
+const stream = await this.run("generate-report", async () => {
+  const response = await fetch("https://api.example.com/report");
+  return response.body!; // ReadableStream<Uint8Array>
+});
+
+// `stream` is a synthetic ReadableStream backed by stored chunks.
+const reader = stream.getReader();
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+  // process each chunk...
+}
+```
+
+**Storage model.** When a `run()` callback returns a `ReadableStream`, the runtime fully consumes the stream chunk-by-chunk and persists each chunk to a `stream_chunks` table in SQLite. The `run()` call blocks until the entire stream is consumed and stored. The attempt is only marked `succeeded` after all chunks have been durably written.
+
+**Replay semantics.** On replay, the callback is not re-executed. Instead, the runtime reconstructs a pull-based `ReadableStream` from the stored chunks. The synthetic stream reads one chunk at a time from SQLite, keeping memory usage proportional to a single chunk rather than the full stream.
+
+**Crash safety.** If stream consumption is interrupted (e.g., the Durable Object is evicted mid-read), the attempt stays in `started` state. On the next replay, the runtime treats it as an interrupted attempt—marks it `failed` and schedules a retry. Orphaned `stream_chunks` rows from the incomplete attempt are harmless: they are never read because only chunks associated with `succeeded` attempts are queried.
 
 ### Alarms
 

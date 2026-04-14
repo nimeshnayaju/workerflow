@@ -1762,6 +1762,435 @@ describe("WorkflowRuntime", () => {
   });
 
 
+  describe("ReadableStream support in run()", () => {
+    it("stores stream chunks and returns a synthetic stream on first run", async () => {
+      const inputBytes = new Uint8Array([72, 101, 108, 108, 111]);
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const stream = await this.run("stream-step", async () => {
+            return new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(inputBytes);
+                controller.close();
+              }
+            });
+          });
+
+          const reader = stream.getReader();
+          const collected: Uint8Array[] = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            collected.push(new Uint8Array(value));
+          }
+
+          await this.run("verify", async () => {
+            return { length: collected.length, firstChunk: Array.from(collected[0]!) };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          const steps = instance.getSteps_experimental();
+          const streamStep = steps.find((s) => s.id === "stream-step");
+          expect(streamStep?.type).toBe("run");
+          const attempts = (streamStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[0]).toMatchObject({
+            state: "succeeded",
+            resultType: "stream"
+          });
+
+          const verifyStep = steps.find((s) => s.id === "verify");
+          expect(verifyStep?.type).toBe("run");
+          const verifyAttempts = (verifyStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(verifyAttempts[0]).toMatchObject({
+            state: "succeeded",
+            resultType: "json"
+          });
+          expect(JSON.parse((verifyAttempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)).toEqual({
+            length: 1,
+            firstChunk: Array.from(inputBytes)
+          });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("replays a stream step from stored chunks without re-executing the callback", async () => {
+      const callCounts = { streamCallback: 0, afterStream: 0 };
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const stream = await this.run("stream-step", async () => {
+            callCounts.streamCallback++;
+            return new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array([1, 2, 3]));
+                controller.close();
+              }
+            });
+          });
+
+          const reader = stream.getReader();
+          const collected: Uint8Array[] = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            collected.push(new Uint8Array(value));
+          }
+
+          callCounts.afterStream++;
+          await this.run("after-stream", async () => {
+            return { bytes: Array.from(collected[0]!) };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          expect(callCounts.streamCallback).toBe(1);
+          expect(callCounts.afterStream).toBeGreaterThanOrEqual(1);
+
+          const steps = instance.getSteps_experimental();
+          const afterStream = steps.find((s) => s.id === "after-stream");
+          expect(afterStream?.type).toBe("run");
+          const attempts = (afterStream as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[0]).toMatchObject({ state: "succeeded", resultType: "json" });
+          expect(
+            JSON.parse((attempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)
+          ).toEqual({ bytes: [1, 2, 3] });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("handles an empty ReadableStream from run()", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const stream = await this.run("empty-stream", async () => {
+            return new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.close();
+              }
+            });
+          });
+
+          const reader = stream.getReader();
+          const { done } = await reader.read();
+          await this.run("after-empty", async () => {
+            return { isEmpty: done };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          const steps = instance.getSteps_experimental();
+          const emptyStep = steps.find((s) => s.id === "empty-stream");
+          expect(emptyStep?.type).toBe("run");
+          const attempts = (emptyStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[0]).toMatchObject({
+            state: "succeeded",
+            resultType: "stream"
+          });
+
+          const afterStep = steps.find((s) => s.id === "after-empty");
+          expect(afterStep?.type).toBe("run");
+          const afterAttempts = (afterStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(JSON.parse((afterAttempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)).toEqual({ isEmpty: true });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("stream step nested inside a parent run() records parentStepId and completes", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run("outer", async () => {
+            const stream = await this.run("inner-stream", async () => {
+              return new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array([10, 20, 30]));
+                  controller.close();
+                }
+              });
+            });
+
+            const reader = stream.getReader();
+            const { value } = await reader.read();
+            return { innerBytes: Array.from(new Uint8Array(value!)) };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          const steps = instance.getSteps_experimental();
+
+          const outer = steps.find((s) => s.id === "outer");
+          expect(outer).toMatchObject({ type: "run", parentStepId: null });
+          const outerAttempts = (outer as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(outerAttempts[0]).toMatchObject({ state: "succeeded", resultType: "json" });
+          expect(JSON.parse((outerAttempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)).toEqual({
+            innerBytes: [10, 20, 30]
+          });
+
+          const inner = steps.find((s) => s.id === "inner-stream");
+          expect(inner).toMatchObject({ type: "run", parentStepId: "outer" });
+          const innerAttempts = (inner as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(innerAttempts[0]).toMatchObject({ state: "succeeded", resultType: "stream" });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("stream step followed by a sibling run() completes across multiple next() calls", async () => {
+      let executeCount = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          executeCount++;
+          const stream = await this.run("stream-step", async () => {
+            return new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array([7, 8, 9]));
+                controller.close();
+              }
+            });
+          });
+
+          const reader = stream.getReader();
+          const collected: number[] = [];
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            collected.push(...new Uint8Array(value));
+          }
+
+          await this.run("sibling-after-stream", async () => {
+            return { collected };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          expect(executeCount).toBeGreaterThanOrEqual(2);
+
+          const steps = instance.getSteps_experimental();
+          const streamStep = steps.find((s) => s.id === "stream-step");
+          expect(streamStep?.type).toBe("run");
+          const streamAttempts = (streamStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(streamAttempts[0]).toMatchObject({ state: "succeeded", resultType: "stream" });
+
+          const sibling = steps.find((s) => s.id === "sibling-after-stream");
+          expect(sibling?.type).toBe("run");
+          const siblingAttempts = (sibling as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(siblingAttempts[0]).toMatchObject({ state: "succeeded", resultType: "json" });
+          expect(
+            JSON.parse((siblingAttempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)
+          ).toEqual({ collected: [7, 8, 9] });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("stream replay works correctly after pause() and resume()", async () => {
+      let streamCallbackCount = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const stream = await this.run("stream-before-pause", async () => {
+            streamCallbackCount++;
+            return new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array([42, 43]));
+                controller.close();
+              }
+            });
+          });
+
+          const reader = stream.getReader();
+          const { value } = await reader.read();
+
+          await this.wait("pause-point", "resume-signal", {
+            timeoutAt: Date.now() + 86_400_000
+          });
+
+          await this.run("after-pause", async () => {
+            return { bytes: Array.from(new Uint8Array(value!)) };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect.poll(() => instance.getStatus()).toBe("running");
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "pause-point");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+
+          expect(streamCallbackCount).toBe(1);
+
+          await instance.pause();
+          expect(instance.getStatus()).toBe("paused");
+
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running" || status === "paused") return;
+            resolve(status);
+          };
+
+          await instance.resume();
+          await instance.handleInboundEvent("resume-signal", undefined);
+          await expect(promise).resolves.toBe("completed");
+
+          expect(streamCallbackCount).toBe(1);
+
+          const steps = instance.getSteps_experimental();
+
+          const streamStep = steps.find((s) => s.id === "stream-before-pause");
+          expect(streamStep?.type).toBe("run");
+          const streamAttempts = (streamStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(streamAttempts[0]).toMatchObject({ state: "succeeded", resultType: "stream" });
+
+          const afterPause = steps.find((s) => s.id === "after-pause");
+          expect(afterPause?.type).toBe("run");
+          const attempts = (afterPause as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts[0]).toMatchObject({ state: "succeeded", resultType: "json" });
+          expect(JSON.parse((attempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>).resultJson)).toEqual({
+            bytes: [42, 43]
+          });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("retries after a stream step callback throws (crash safety)", async () => {
+      let callbackCount = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          const stream = await this.run(
+            "crashable-stream",
+            async () => {
+              callbackCount++;
+              if (callbackCount === 1) {
+                throw new Error("simulated crash");
+              }
+              return new ReadableStream<Uint8Array>({
+                start(controller) {
+                  controller.enqueue(new Uint8Array([99]));
+                  controller.close();
+                }
+              });
+            },
+            { maxAttempts: 3 }
+          );
+
+          const reader = stream.getReader();
+          const { value } = await reader.read();
+          await this.run("after-retry", async () => {
+            return { byte: Array.from(new Uint8Array(value!)) };
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") return;
+            resolve(status);
+          };
+
+          await instance.create({ definitionVersion: "2026-03-19" });
+          await expect(promise).resolves.toBe("completed");
+
+          expect(callbackCount).toBe(2);
+
+          const steps = instance.getSteps_experimental();
+          const crashStep = steps.find((s) => s.id === "crashable-stream");
+          expect(crashStep?.type).toBe("run");
+          const attempts = (crashStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          expect(attempts).toHaveLength(2);
+          expect(attempts[0]).toMatchObject({ state: "failed" });
+          expect(attempts[1]).toMatchObject({
+            state: "succeeded",
+            resultType: "stream"
+          });
+
+          const afterStep = steps.find((s) => s.id === "after-retry");
+          expect(afterStep?.type).toBe("run");
+          const afterAttempts = (afterStep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          const afterResult = afterAttempts[0]! as Extract<RunStepAttempt, { resultType: "json" }>;
+          expect(JSON.parse(afterResult.resultJson)).toEqual({ byte: [99] });
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+  });
+
   describe("WorkflowRuntimeContext", () => {
     describe("run steps", () => {
       describe("getOrCreateRunStep()", () => {
@@ -2000,6 +2429,252 @@ describe("WorkflowRuntime", () => {
             expect(() => context.handleRunAttemptSucceeded(createRunStepId("step-1"), null)).toThrow(
               /No attempt in progress/
             );
+          });
+        });
+      });
+
+      describe("handleRunAttemptStreamResult()", () => {
+        it("consumes a stream, stores chunks, and marks the attempt succeeded", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("stream-step"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("stream-step"));
+
+            const chunks = [new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6])];
+            const inputStream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                for (const chunk of chunks) controller.enqueue(chunk);
+                controller.close();
+              }
+            });
+
+            const syntheticStream = await context.handleRunAttemptStreamResult(
+              createRunStepId("stream-step"),
+              inputStream
+            );
+
+            const step = context.getOrCreateRunStep(createRunStepId("stream-step"), { parentStepId: null });
+            expect(step.attempts).toHaveLength(1);
+            expect(step.attempts[0]).toMatchObject({
+              state: "succeeded",
+              resultType: "stream"
+            });
+
+            const storedChunks = state.storage.sql
+              .exec<{ seq: number; data: ArrayBuffer }>(
+                "SELECT seq, data FROM stream_chunks WHERE attempt_id = ? ORDER BY seq",
+                step.attempts[0]!.id
+              )
+              .toArray();
+            expect(storedChunks).toHaveLength(2);
+            expect(new Uint8Array(storedChunks[0]!.data)).toEqual(new Uint8Array([1, 2, 3]));
+            expect(new Uint8Array(storedChunks[1]!.data)).toEqual(new Uint8Array([4, 5, 6]));
+
+            const reader = syntheticStream.getReader();
+            const r1 = await reader.read();
+            expect(r1.done).toBe(false);
+            expect(new Uint8Array(r1.value!)).toEqual(new Uint8Array([1, 2, 3]));
+            const r2 = await reader.read();
+            expect(r2.done).toBe(false);
+            expect(new Uint8Array(r2.value!)).toEqual(new Uint8Array([4, 5, 6]));
+            const r3 = await reader.read();
+            expect(r3.done).toBe(true);
+          });
+        });
+
+        it("handles an empty stream", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("empty-stream"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("empty-stream"));
+
+            const inputStream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.close();
+              }
+            });
+
+            const syntheticStream = await context.handleRunAttemptStreamResult(
+              createRunStepId("empty-stream"),
+              inputStream
+            );
+
+            const step = context.getOrCreateRunStep(createRunStepId("empty-stream"), { parentStepId: null });
+            expect(step.attempts[0]).toMatchObject({
+              state: "succeeded",
+              resultType: "stream"
+            });
+
+            const storedChunks = state.storage.sql
+              .exec("SELECT seq FROM stream_chunks WHERE attempt_id = ?", step.attempts[0]!.id)
+              .toArray();
+            expect(storedChunks).toHaveLength(0);
+
+            const reader = syntheticStream.getReader();
+            const result = await reader.read();
+            expect(result.done).toBe(true);
+          });
+        });
+
+        it("throws when the step does not exist", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.close();
+              }
+            });
+            await expect(
+              context.handleRunAttemptStreamResult(createRunStepId("nonexistent"), stream)
+            ).rejects.toThrow(/not found/);
+          });
+        });
+
+        it("throws when no attempt is in progress", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const stream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.close();
+              }
+            });
+            await expect(
+              context.handleRunAttemptStreamResult(createRunStepId("step-1"), stream)
+            ).rejects.toThrow(/No in-flight attempt/);
+          });
+        });
+
+        it("orphaned stream_chunks from a failed attempt do not corrupt the retried attempt", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { maxAttempts: 3, parentStepId: null });
+
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            const step1 = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const attempt1Id = step1.attempts[0]!.id;
+
+            state.storage.sql.exec(
+              "INSERT INTO stream_chunks (attempt_id, seq, data) VALUES (?, ?, ?)",
+              attempt1Id,
+              0,
+              new Uint8Array([0xDE, 0xAD])
+            );
+            state.storage.sql.exec(
+              "INSERT INTO stream_chunks (attempt_id, seq, data) VALUES (?, ?, ?)",
+              attempt1Id,
+              1,
+              new Uint8Array([0xBE, 0xEF])
+            );
+
+            context.handleRunAttemptFailed(createRunStepId("step-1"), {
+              errorMessage: "stream interrupted"
+            });
+
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+
+            const goodStream = new ReadableStream<Uint8Array>({
+              start(controller) {
+                controller.enqueue(new Uint8Array([1, 2, 3]));
+                controller.close();
+              }
+            });
+
+            const syntheticStream = await context.handleRunAttemptStreamResult(
+              createRunStepId("step-1"),
+              goodStream
+            );
+
+            const step2 = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            expect(step2.attempts).toHaveLength(2);
+            const failedAttempt = step2.attempts.find((a) => a.state === "failed");
+            const succeededAttempt = step2.attempts.find((a) => a.state === "succeeded");
+            expect(failedAttempt).toBeDefined();
+            expect(succeededAttempt).toMatchObject({ state: "succeeded", resultType: "stream" });
+
+            const attempt2Id = succeededAttempt!.id;
+
+            const orphanedRows = state.storage.sql
+              .exec<{ seq: number; data: ArrayBuffer }>(
+                "SELECT seq, data FROM stream_chunks WHERE attempt_id = ? ORDER BY seq",
+                attempt1Id
+              )
+              .toArray();
+            expect(orphanedRows).toHaveLength(2);
+            expect(new Uint8Array(orphanedRows[0]!.data)).toEqual(new Uint8Array([0xde, 0xad]));
+
+            const goodRows = state.storage.sql
+              .exec<{ seq: number; data: ArrayBuffer }>(
+                "SELECT seq, data FROM stream_chunks WHERE attempt_id = ? ORDER BY seq",
+                attempt2Id
+              )
+              .toArray();
+            expect(goodRows).toHaveLength(1);
+            expect(new Uint8Array(goodRows[0]!.data)).toEqual(new Uint8Array([1, 2, 3]));
+
+            const reader = syntheticStream.getReader();
+            const { value } = await reader.read();
+            expect(new Uint8Array(value!)).toEqual(new Uint8Array([1, 2, 3]));
+            const { done } = await reader.read();
+            expect(done).toBe(true);
+          });
+        });
+      });
+
+      describe("getStoredStream()", () => {
+        it("reconstructs a stream from stored chunks", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            context.handleRunAttemptSucceeded(createRunStepId("step-1"), null);
+
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const attemptId = step.attempts[0]!.id;
+
+            state.storage.sql.exec(
+              "INSERT INTO stream_chunks (attempt_id, seq, data) VALUES (?, ?, ?)",
+              attemptId,
+              0,
+              new Uint8Array([10, 20])
+            );
+            state.storage.sql.exec(
+              "INSERT INTO stream_chunks (attempt_id, seq, data) VALUES (?, ?, ?)",
+              attemptId,
+              1,
+              new Uint8Array([30, 40])
+            );
+
+            const stream = context.getStoredStream(attemptId);
+            const reader = stream.getReader();
+            const r1 = await reader.read();
+            expect(new Uint8Array(r1.value!)).toEqual(new Uint8Array([10, 20]));
+            const r2 = await reader.read();
+            expect(new Uint8Array(r2.value!)).toEqual(new Uint8Array([30, 40]));
+            const r3 = await reader.read();
+            expect(r3.done).toBe(true);
+          });
+        });
+
+        it("returns an empty stream when no chunks exist", async () => {
+          const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+          await runInDurableObject(stub, async (_instance, state) => {
+            const context = new WorkflowRuntimeContext(state.storage);
+            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            context.handleRunAttemptStarted(createRunStepId("step-1"));
+            context.handleRunAttemptSucceeded(createRunStepId("step-1"), null);
+
+            const step = context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
+            const stream = context.getStoredStream(step.attempts[0]!.id);
+            const reader = stream.getReader();
+            const result = await reader.read();
+            expect(result.done).toBe(true);
           });
         });
       });
