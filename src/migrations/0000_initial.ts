@@ -5,7 +5,7 @@ export default `
     id INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
 
     status TEXT NOT NULL CHECK (
-      status IN ('pending', 'running', 'paused', 'completed', 'failed', 'cancelled')
+      status IN ('pending', 'initialized', 'running', 'paused', 'completed', 'failed', 'cancelled')
     ),
 
     created_at INTEGER NOT NULL
@@ -15,18 +15,13 @@ export default `
     updated_at INTEGER NOT NULL
       DEFAULT (CAST(unixepoch('subsecond') * 1000 AS INTEGER)),
 
-    definition_version TEXT
-      CHECK (definition_version IS NULL OR length(definition_version) > 0),
     definition_input TEXT
       CHECK (definition_input IS NULL OR json_valid(definition_input)),
 
     CHECK (updated_at >= created_at),
 
-    -- definition_input must be NULL if definition_version is NULL
-    CHECK (definition_version IS NOT NULL OR definition_input IS NULL),
-
-    -- definition must be pinned before running/paused/completing/failing; cancelled is always allowed
-    CHECK (status IN ('pending', 'cancelled') OR definition_version IS NOT NULL)
+    -- definition_input must be NULL until create() initializes the workflow.
+    CHECK (status <> 'pending' OR definition_input IS NULL)
   ) STRICT;
 
   CREATE TABLE steps (
@@ -278,8 +273,10 @@ export default `
   WHEN NEW.status <> OLD.status
   BEGIN
     SELECT CASE
-      WHEN OLD.status = 'pending' AND NEW.status NOT IN ('running', 'cancelled') THEN
-        RAISE(ABORT, 'pending can only transition to running or cancelled')
+      WHEN OLD.status = 'pending' AND NEW.status NOT IN ('initialized', 'cancelled') THEN
+        RAISE(ABORT, 'pending can only transition to initialized or cancelled')
+      WHEN OLD.status = 'initialized' AND NEW.status NOT IN ('running', 'cancelled') THEN
+        RAISE(ABORT, 'initialized can only transition to running or cancelled')
       WHEN OLD.status = 'running' AND NEW.status NOT IN ('paused', 'completed', 'failed', 'cancelled') THEN
         RAISE(ABORT, 'running can only transition to paused, completed, failed, or cancelled')
       WHEN OLD.status = 'paused' AND NEW.status NOT IN ('running', 'cancelled') THEN
@@ -287,6 +284,14 @@ export default `
       WHEN OLD.status IN ('completed', 'failed', 'cancelled') THEN
         RAISE(ABORT, 'terminal status cannot transition')
     END;
+  END;
+
+  CREATE TRIGGER workflow_metadata_definition_input_immutable_after_init
+  BEFORE UPDATE ON workflow_metadata
+  FOR EACH ROW
+  WHEN OLD.status <> 'pending' AND NEW.definition_input IS NOT OLD.definition_input
+  BEGIN
+    SELECT RAISE(ABORT, 'workflow_metadata.definition_input is immutable after initialization');
   END;
 
   CREATE TRIGGER steps_immutable_identity_fields

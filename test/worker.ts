@@ -6,9 +6,7 @@ export type Env = {
 };
 
 export class TestWorkflowRuntime extends WorkflowRuntime {
-  protected getDefinition() {
-    return this.ctx.exports.TestWorkflowDefinition;
-  }
+  protected readonly definition = this.ctx.exports.TestWorkflowDefinition;
 }
 export class TestWorkflowDefinition extends WorkflowDefinition {
   async execute(): Promise<void> {}

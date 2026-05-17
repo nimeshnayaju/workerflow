@@ -48,7 +48,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
       });
     } finally {
@@ -71,7 +71,7 @@ describe("WorkflowRuntime", () => {
           if (status === "running") return;
           resolve(status);
         };
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
       });
     } finally {
@@ -96,7 +96,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
@@ -136,7 +136,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
@@ -170,7 +170,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
       });
     } finally {
@@ -200,7 +200,7 @@ describe("WorkflowRuntime", () => {
           if (status === "running") return;
           resolve(status);
         };
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("completed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
@@ -237,7 +237,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("failed");
         const steps = instance.getSteps_experimental();
         expect(steps).toHaveLength(1);
@@ -268,7 +268,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("completed");
 
         const steps = instance.getSteps_experimental();
@@ -311,7 +311,7 @@ describe("WorkflowRuntime", () => {
           resolve(status);
         };
 
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("completed");
 
         const steps = instance.getSteps_experimental();
@@ -351,7 +351,7 @@ describe("WorkflowRuntime", () => {
             if (status === "running") return;
             resolve(status);
           };
-          await instance.create({ definitionVersion: "2026-03-19", input });
+          await instance.create(input);
           await expect(promise).resolves.toBe("completed");
         });
         expect(received.length).toBeGreaterThanOrEqual(1);
@@ -363,27 +363,80 @@ describe("WorkflowRuntime", () => {
       }
     });
 
-    it("throws when the workflow is not terminal and definition version is already pinned to a different version", async () => {
+    it("does not repin input after the workflow is initialized", async () => {
+      const received: unknown[] = [];
       const executeSpy = vi
         .spyOn(TestWorkflowDefinition.prototype, "execute")
         .mockImplementation(async function (this: TestWorkflowDefinition) {
-          await this.wait("wait-1", "event-never", {
+          received.push(this.ctx.props.input);
+          await this.wait("wait-1", "event-done", {
             timeoutAt: Date.now() + 86_400_000
           });
         });
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          const { resolve: resolveRunning, promise: running } = Promise.withResolvers<WorkflowStatus>();
+          const { resolve: resolveDone, promise: done } = Promise.withResolvers<WorkflowStatus>();
           instance.onStatusChange_experimental = async (status) => {
-            resolve(status);
+            if (status === "running") {
+              resolveRunning(status);
+            } else {
+              resolveDone(status);
+            }
           };
-          await instance.create({ definitionVersion: "2026-03-19" });
-          await expect(promise).resolves.toBe("running");
+          const input = { key: "original" };
+          await instance.create(input);
+          await expect(running).resolves.toBe("running");
 
-          await expect(instance.create({ definitionVersion: "2026-03-20" })).rejects.toThrow(
-            "Workflow definition version is already pinned to '2026-03-19' and cannot be changed to '2026-03-20'."
-          );
+          await instance.create({ key: "ignored" });
+          await instance.handleInboundEvent("event-done");
+          await expect(done).resolves.toBe("completed");
+
+          expect(received.length).toBeGreaterThanOrEqual(1);
+          for (const row of received) {
+            expect(row).toEqual(input);
+          }
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("does not repin undefined input after the workflow is initialized", async () => {
+      const received: unknown[] = [];
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          received.push(this.ctx.props.input);
+          await this.wait("wait-1", "event-done", {
+            timeoutAt: Date.now() + 86_400_000
+          });
+        });
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          const { resolve: resolveRunning, promise: running } = Promise.withResolvers<WorkflowStatus>();
+          const { resolve: resolveDone, promise: done } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange_experimental = async (status) => {
+            if (status === "running") {
+              resolveRunning(status);
+            } else {
+              resolveDone(status);
+            }
+          };
+
+          await instance.create();
+          await expect(running).resolves.toBe("running");
+
+          await instance.create({ key: "ignored" });
+          await instance.handleInboundEvent("event-done");
+          await expect(done).resolves.toBe("completed");
+
+          expect(received.length).toBeGreaterThanOrEqual(1);
+          for (const row of received) {
+            expect(row).toBeUndefined();
+          }
         });
       } finally {
         executeSpy.mockRestore();
@@ -398,11 +451,11 @@ describe("WorkflowRuntime", () => {
           if (status === "running") return;
           resolve(status);
         };
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("completed");
         expect(instance.getStatus()).toBe("completed");
 
-        await instance.create({ definitionVersion: "2026-03-20" });
+        await instance.create();
         expect(instance.getStatus()).toBe("completed");
       });
     });
@@ -428,7 +481,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -466,7 +519,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -508,7 +561,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -549,7 +602,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -585,7 +638,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -619,7 +672,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -673,7 +726,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("failed");
 
           const steps = instance.getSteps_experimental();
@@ -720,7 +773,7 @@ describe("WorkflowRuntime", () => {
               resolve(status);
             };
 
-            await instance.create({ definitionVersion: "2026-03-19" });
+            await instance.create();
             await expect(promise).resolves.toBe("completed");
 
             expect(innerAttempts).toBe(2);
@@ -762,7 +815,7 @@ describe("WorkflowRuntime", () => {
               resolve(status);
             };
 
-            await instance.create({ definitionVersion: "2026-03-19" });
+            await instance.create();
             await expect(promise).resolves.toBe("failed");
 
             const steps = instance.getSteps_experimental();
@@ -805,7 +858,7 @@ describe("WorkflowRuntime", () => {
               resolve(status);
             };
 
-            await instance.create({ definitionVersion: "2026-03-19" });
+            await instance.create();
             await expect(promise).resolves.toBe("failed");
 
             const steps = instance.getSteps_experimental();
@@ -845,7 +898,7 @@ describe("WorkflowRuntime", () => {
               resolve(status);
             };
 
-            await instance.create({ definitionVersion: "2026-03-19" });
+            await instance.create();
             await expect
               .poll(() => {
                 const step = instance.getSteps_experimental().find((s) => s.id === "root-deep-wait");
@@ -895,7 +948,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -934,7 +987,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const steps = instance.getSteps_experimental();
@@ -978,7 +1031,7 @@ describe("WorkflowRuntime", () => {
             terminalStatuses.push(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           expect(terminalStatuses).toHaveLength(0);
 
@@ -1028,7 +1081,7 @@ describe("WorkflowRuntime", () => {
             terminalStatuses.push(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           expect(terminalStatuses).toHaveLength(0);
 
@@ -1065,7 +1118,7 @@ describe("WorkflowRuntime", () => {
           if (status === "running") return;
           resolve(status);
         };
-        await instance.create({ definitionVersion: "2026-03-19" });
+        await instance.create();
         await expect(promise).resolves.toBe("completed");
       });
 
@@ -1084,7 +1137,7 @@ describe("WorkflowRuntime", () => {
             if (status === "running") return;
             resolve(status);
           };
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("failed");
         });
 
@@ -1117,7 +1170,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await expect
             .poll(() => {
@@ -1151,7 +1204,7 @@ describe("WorkflowRuntime", () => {
             if (status === "paused") resolve();
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await instance.pause();
           await promise;
         });
@@ -1179,7 +1232,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await instance.pause();
           expect(instance.getStatus()).toBe("paused");
@@ -1208,7 +1261,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await instance.pause();
           expect(instance.getStatus()).toBe("paused");
@@ -1241,7 +1294,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await expect(instance.resume()).rejects.toThrow(
             "Cannot resume workflow: expected status 'paused' but got 'running'."
@@ -1262,7 +1315,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -1306,7 +1359,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect
             .poll(() => {
               const step = instance.getSteps_experimental().find((s) => s.id === "wait-1");
@@ -1343,7 +1396,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await expect
             .poll(() => {
@@ -1386,7 +1439,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -1437,7 +1490,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -1485,7 +1538,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -1533,7 +1586,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
 
           await expect
             .poll(() => {
@@ -1583,7 +1636,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           // Should not throw even though there is no matching wait step
@@ -1609,7 +1662,7 @@ describe("WorkflowRuntime", () => {
       });
     });
 
-    it("records 'started' when workflow transitions from pending to running", async () => {
+    it("records 'started' when workflow transitions from initialized to running", async () => {
       const executeSpy = vi
         .spyOn(TestWorkflowDefinition.prototype, "execute")
         .mockImplementation(async function (this: TestWorkflowDefinition) {
@@ -1625,7 +1678,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("completed");
 
           const events = instance.getWorkflowEvents_experimental();
@@ -1646,7 +1699,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await instance.pause();
 
@@ -1674,7 +1727,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await instance.pause();
           await instance.resume();
@@ -1706,7 +1759,7 @@ describe("WorkflowRuntime", () => {
             resolve(status);
           };
 
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect(promise).resolves.toBe("failed");
 
           const events = instance.getWorkflowEvents_experimental();
@@ -1727,7 +1780,7 @@ describe("WorkflowRuntime", () => {
       try {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
-          await instance.create({ definitionVersion: "2026-03-19" });
+          await instance.create();
           await expect.poll(() => instance.getStatus()).toBe("running");
           await instance.cancel("user requested cancellation");
 
@@ -1760,7 +1813,6 @@ describe("WorkflowRuntime", () => {
       });
     });
   });
-
 
   describe("WorkflowRuntimeContext", () => {
     describe("run steps", () => {

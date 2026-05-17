@@ -4,15 +4,11 @@ import type { Json } from "./json";
 import mig000 from "./migrations/0000_initial";
 import type { Brand } from "./brand";
 
-export abstract class WorkflowRuntime<
-  TInput extends Json | undefined = Json | undefined,
-  TVersion extends string = string
-> extends DurableObject {
+export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | undefined> extends DurableObject {
   private static readonly MIGRATIONS = [mig000];
   private readonly sql: SqlStorage;
   #status: WorkflowStatus;
   #isRunLoopActive: boolean = false;
-  #definitionVersion: TVersion | undefined;
   #definitionInput: TInput | undefined;
 
   /**
@@ -46,24 +42,19 @@ export abstract class WorkflowRuntime<
       console.error("Database migration version is ahead of the codebase. Please check your migrations.");
     }
 
-    const [metadata] = this.sql
-      .exec<WorkflowMetadata_Row<TVersion>>("SELECT * FROM workflow_metadata WHERE id = 1")
-      .toArray();
+    const [metadata] = this.sql.exec<WorkflowMetadata_Row>("SELECT * FROM workflow_metadata WHERE id = 1").toArray();
     if (metadata === undefined) {
       this.sql.exec("INSERT INTO workflow_metadata (id, status) VALUES (1, ?)", "pending");
       this.sql.exec("INSERT INTO workflow_events (type) VALUES (?)", "created");
       this.#status = "pending";
     } else {
       this.#status = metadata.status;
-      this.#definitionVersion = metadata.definition_version === null ? undefined : metadata.definition_version;
       this.#definitionInput =
         metadata.definition_input === null ? undefined : (JSON.parse(metadata.definition_input) as TInput);
     }
   }
 
-  protected abstract getDefinition(
-    version: TVersion
-  ): (options: {
+  protected abstract readonly definition: (options: {
     props: { requestId: string; runtimeInstanceId: string; input: TInput };
   }) => Fetcher<WorkflowDefinition<TInput>>;
 
@@ -321,49 +312,42 @@ export abstract class WorkflowRuntime<
   }
 
   /**
-   * Creates a new workflow instance and pins the definition version. If the workflow is in a terminal state, it will
-   * return early. Otherwise, it will pin the definition version and set the input. If the definition version is already
-   * pinned to a different version, it will throw an error.
+   * Creates a new workflow instance and pins the input. If the workflow is in a terminal state or paused, it will
+   * return early. Otherwise, it will pin the input the first time the instance is initialized and start execution.
    *
-   * @param options.definitionVersion - The version of the definition to pin to the workflow instance. This will be used
-   *   to resolve the workflow definition from the `getDefinition` hook.
-   * @param options.input - The input to the workflow instance. This will be passed to the workflow definition as the
-   *   `input` property.
+   * @param input - The input to the workflow instance. This will be passed to the workflow definition as the `input`
+   *   property.
    */
-  public async create(options: { definitionVersion: TVersion; input?: TInput }): Promise<void> {
+  public async create(...args: undefined extends TInput ? [input?: TInput] : [input: TInput]): Promise<void> {
+    const input = args[0];
     if (this.isTerminalStatus(this.#status)) return;
     if (this.#status === "paused") return;
 
-    const version = options.definitionVersion;
     let metadata = this.sql
-      .exec<Pick<WorkflowMetadata_Row<TVersion>, "definition_version" | "definition_input">>(
-        "SELECT definition_version, definition_input FROM workflow_metadata WHERE id = 1"
+      .exec<Pick<WorkflowMetadata_Row, "status" | "definition_input">>(
+        "SELECT status, definition_input FROM workflow_metadata WHERE id = 1"
       )
       .one();
 
-    if (metadata.definition_version !== null && metadata.definition_version !== version) {
-      throw new Error(
-        `Workflow definition version is already pinned to '${metadata.definition_version}' and cannot be changed to '${version}'.`
-      );
-    }
-
-    // If the workflow is not yet pinned to a definition version, we pin it to the new version and set the input.
-    if (metadata.definition_version === null) {
+    // If the workflow is not yet initialized, pin the input. `undefined` is encoded as SQL NULL.
+    if (metadata.status === "pending") {
       metadata = this.sql
-        .exec<Pick<WorkflowMetadata_Row<TVersion>, "definition_version" | "definition_input">>(
+        .exec<Pick<WorkflowMetadata_Row, "status" | "definition_input">>(
           `UPDATE workflow_metadata
-						SET definition_version = ?,
+						SET status = 'initialized',
 								definition_input = ?,
 								updated_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER)
-						WHERE id = 1 RETURNING definition_version, definition_input`,
-          version,
-          options.input ? JSON.stringify(options.input) : null
+						WHERE id = 1
+							AND status = 'pending'
+						RETURNING status, definition_input`,
+          input === undefined ? null : JSON.stringify(input)
         )
         .one();
     }
 
-    this.#definitionVersion = version;
-    this.#definitionInput = metadata.definition_input ? (JSON.parse(metadata.definition_input) as TInput) : undefined;
+    this.#status = metadata.status;
+    this.#definitionInput =
+      metadata.definition_input === null ? undefined : (JSON.parse(metadata.definition_input) as TInput);
 
     await this.run();
   }
@@ -372,7 +356,7 @@ export abstract class WorkflowRuntime<
     if (this.isTerminalStatus(this.#status)) return;
     if (this.#status === "paused") return;
 
-    if (this.#definitionVersion === undefined) return;
+    if (this.#status === "pending") return;
 
     if (this.#status !== "running") {
       this.#setStatus({ type: "running" });
@@ -411,15 +395,11 @@ export abstract class WorkflowRuntime<
           }
 
           try {
-            const version = this.#definitionVersion;
-            if (version === undefined) {
-              throw new Error(
-                "Workflow definition version has not been initialized. Call 'create()' before running the workflow."
-              );
+            if (this.#status === "pending") {
+              throw new Error("Workflow input has not been initialized. Call 'create()' before running the workflow.");
             }
 
-            const definition = this.getDefinition(version);
-            const executor = definition({
+            const executor = this.definition({
               props: {
                 runtimeInstanceId: this.ctx.id.toString(),
                 requestId,
@@ -887,10 +867,7 @@ export type RunStepAttempt = {
   startedAt: Date;
 } & (
   | { state: "started" }
-  | ({ state: "succeeded"; endedAt: Date } & (
-      | { resultType: "json"; resultJson: string }
-      | { resultType: "none" }
-    ))
+  | ({ state: "succeeded"; endedAt: Date } & ({ resultType: "json"; resultJson: string } | { resultType: "none" }))
   | { state: "failed"; errorMessage: string; errorName?: string; endedAt: Date; nextAttemptAt?: Date }
 );
 
@@ -1294,18 +1271,18 @@ type TimedOutWaitStep_Row = Extract<WaitStep_Row, { state: "timed_out" }>;
 type Step_Row = RunStep_Row | SleepStep_Row | WaitStep_Row;
 
 export type WorkflowStatus =
-  | "pending" // The workflow has been created but 'run' hasn't been called yet
+  | "pending" // Durable metadata exists, but create() has not initialized the workflow input yet
+  | "initialized" // create() has pinned the workflow input, but execution has not started yet
   | "running" // The workflow is currently executing; steps are being created/processed
   | "paused" // The workflow is paused and will not make progress until resumed
   | "completed" // The workflow completed successfully; ('Workflow.next' returned { done: true, status: "succeeded" })
   | "failed" // A step exhausted retries and the workflow aborted; ('Workflow.next' returned { done: true, status: "failed" })
   | "cancelled"; // The workflow was terminated explicitly by the user.
 
-type WorkflowMetadata_Row<TVersion extends string> = {
+type WorkflowMetadata_Row = {
   created_at: number;
   updated_at: number;
   status: WorkflowStatus;
-  definition_version: TVersion | null;
   definition_input: string | null;
 };
 

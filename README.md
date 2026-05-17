@@ -33,22 +33,14 @@ tag = "v1"
 new_sqlite_classes = ["OrderWorkflowRuntime"]
 ```
 
-In your Worker module, export the runtime, the definition, and a **`fetch`** handler (or queue consumer, cron trigger, and so on) that obtains a namespace stub and calls **`create`** to pin a definition version and optional input:
+In your Worker module, export the runtime, the definition, and a **`fetch`** handler (or queue consumer, cron trigger, and so on) that obtains a namespace stub and calls **`create`** to pin the workflow input:
 
 ```ts
 // src/worker.ts
 import { WorkflowDefinition, WorkflowRuntime } from "workerflow";
 
 export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
-  /** Resolves which `WorkerEntrypoint` implementation runs for a pinned `definitionVersion`. */
-  protected getDefinition(version: string) {
-    switch (version) {
-      case "2026-04-01":
-        return this.ctx.exports.OrderWorkflowDefinition;
-      default:
-        throw new Error(`Unsupported workflow definition version: ${version}`);
-    }
-  }
+  protected readonly definition = this.ctx.exports.OrderWorkflowDefinition;
 }
 
 export class OrderWorkflowDefinition extends WorkflowDefinition<{ orderId: string }> {
@@ -79,7 +71,7 @@ export default {
     if (url.pathname === "/orders") {
       const orderId = "new-order";
       const stub = env.ORDER_WORKFLOW.getByName(orderId);
-      await stub.create({ definitionVersion: "2026-04-01", input: { orderId } });
+      await stub.create({ orderId });
       return Response.json({ id: orderId });
     }
 
@@ -88,18 +80,18 @@ export default {
 } satisfies ExportedHandler<Env>;
 ```
 
-Workflow input is **`this.ctx.props.input`**, populated from **`create({ input })`**. The runtime also sets **`this.ctx.props.requestId`** (a new UUID each time the run loop invokes your definition) and **`this.ctx.props.runtimeInstanceId`** (this Durable Object’s id) for logs and correlation. Use a **stable `definitionVersion`** string per deploy you want long-running instances to keep using; add a new version in **`getDefinition`** when you ship breaking definition changes.
+Workflow input is **`this.ctx.props.input`**, populated from **`create(input)`**. TypeScript requires an input argument when your runtime's **`TInput`** excludes **`undefined`**; no-input workflows can use **`WorkflowRuntime<undefined>`**, and optionally-input workflows can include **`undefined`** in the input type. The runtime also sets **`this.ctx.props.requestId`** (a new UUID each time the run loop invokes your definition) and **`this.ctx.props.runtimeInstanceId`** (this Durable Object’s id) for logs and correlation.
 
 ### Runtime control
 
 From the Durable Object stub you can:
 
-- **`create({ definitionVersion, input? })`** — Pins the version and optional input in SQLite the **first** time the instance is initialized, then starts execution. **No-op** if the workflow is already **completed**, **failed**, **cancelled**, or **paused**. Throws if the object was already pinned to a **different** version.
+- **`create(input)`** — Pins the workflow input in SQLite the **first** time the instance is initialized, then starts execution. The input argument is required unless **`TInput`** includes **`undefined`**. **No-op** if the workflow is already **completed**, **failed**, **cancelled**, or **paused**.
 - **`pause()`** — When status is **running**, moves to **paused**, clears alarms, and stops driving **`execute()`** until **`resume()`**. Inbound events are queued and applied when a matching **`wait`** runs again after resume.
 - **`resume()`** — When status is **paused**, moves to **running** and continues the loop. Throws if the workflow is not paused.
 - **`cancel(reason?)`** — Moves to terminal **cancelled** and clears alarms.
 
-New instances start in **`pending`** until the first transition to **`running`**.
+New instances start in **`pending`**. The first **`create()`** call moves the instance through the durable **`initialized`** state before execution enters **`running`**.
 
 ### Experimental introspection
 
@@ -193,27 +185,21 @@ At this point there is no sleep alarm, no retry alarm, and no wait-timeout alarm
 
 There is also a guard for the case where an alarm fires while the run loop is already active — for example, a sleep's precise alarm arriving while the loop is processing another step in the same Durable Object invocation. In that situation the alarm handler simply reschedules the watchdog for another 30 minutes rather than starting a second concurrent loop, keeping the safety net in place until the active loop finishes.
 
-### Versioning
-
-`create({ definitionVersion, input })` **pins** the definition version and optional input in SQLite the first time the instance is initialized (see [Runtime control](#runtime-control) for no-op cases). **The version cannot be changed later** for that Durable Object id; attempting a different version throws. Every subsequent `next()` resolves the worker implementation via **`getDefinition(version)`** using that pinned value, so **long-lived workflows keep running the definition lineage they started with**, while new instances can use newer version strings you add to `getDefinition`.
-
 ## Why this exists
 
-Cloudflare Workflows is a strong managed option, and for many use cases it is the right tradeoff. I built `workerflow` for cases where I wanted tighter control over runtime behavior, definition versioning, and state projection than the managed model naturally gives me.
+Cloudflare Workflows is a strong managed option, and for many use cases it is the right tradeoff. I built `workerflow` for cases where I wanted tighter control over runtime behavior, replay semantics, and state projection than the managed model naturally gives me.
 
 1. Explicit ownership of workflow state and lifecycle
-2. A clear story for versioning workflow definitions
+2. Durable replay semantics that are explicit in userland code
 3. Separation between workflow execution and external state synchronization
 4. Extension points for streaming, WebSockets, and custom hooks
 5. Fewer surprises around long-lived execution and error handling
 
-### Versioning workflow definitions
+### Definition compatibility
 
 One of the biggest concerns in long-running workflows is definition drift. A normal Worker request is typically bound to a single in-flight execution on one deployed version, but a Workflow is durable: it persists state and resumes across multiple executions over time. A workflow may start on one version of its definition and resume later after a deploy has changed or removed a step. That means the next invocation of the workflow entry point could repeat steps unsafely or leave the runtime in an invalid state.
 
-Versioning does not eliminate these problems, but it makes the risk explicit. It forces you to think about compatibility, migration, and long-lived execution up front. Cloudflare Workflows can support version-aware workflows by passing a version token in the immutable per-instance parameters and branching in workflow code or by maintaining a version mapping in an external database, but both are conventions that your application is responsible for maintaining.
-
-`workerflow` takes a different approach: the runtime pins a definition version when the instance is created and resolves future execution against that pinned version. The goal is not to make compatibility problems disappear, but to make the version boundary explicit in the runtime rather than implicit in workflow input and application code.
+`workerflow` keeps definition selection simple: each runtime points at one definition entrypoint, and the input is the only per-instance payload pinned by `create(input)`. If a workflow needs version-aware behavior, model that explicitly in your input shape and keep old branches compatible until the long-lived instances that need them have completed.
 
 ### Keeping workflow execution separate from state projection
 
@@ -245,11 +231,9 @@ I think a cleaner design is to keep synchronization logic out of workflow steps 
 
 ```ts
 export class MyWorkflowRuntime extends WorkflowRuntime {
-  async onStatusChange_experimental(
-    status: "running" | "paused" | "completed" | "failed" | "cancelled"
-  ) {
+  async onStatusChange_experimental(status: "running" | "paused" | "completed" | "failed" | "cancelled") {
     // Update your database, or push to a queue for streaming.
-    // Note: the hook is also invoked with "running" when leaving pending/paused into running.
+    // Note: the hook is also invoked with "running" when leaving initialized/paused into running.
   }
 }
 ```
