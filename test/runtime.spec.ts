@@ -1,4 +1,4 @@
-import { runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
+import { abortAllDurableObjects, evictDurableObject, runInDurableObject, runDurableObjectAlarm } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import {
@@ -31,6 +31,417 @@ describe("WorkflowRuntime", () => {
     });
   });
 
+  describe("Durable Object restarts", () => {
+    it("restores workflow input and resumes a persisted wait without replaying completed side effects", async () => {
+      const receivedInputs: unknown[] = [];
+      let beforeWaitRuns = 0;
+      let afterWaitRuns = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          receivedInputs.push(this.ctx.props.input);
+          await this.run("before-eviction", async () => {
+            beforeWaitRuns++;
+            return "persisted";
+          });
+          const payload = await this.wait<{ value: number }>("wait-across-eviction", "resume-after-eviction");
+          await this.run("after-eviction", async () => {
+            afterWaitRuns++;
+            return payload;
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        const input = { workflow: "eviction-test" };
+
+        await runInDurableObject(stub, async (instance) => {
+          await instance.create(input);
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-across-eviction");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+        });
+
+        await evictDurableObject(stub);
+        await stub.handleInboundEvent("resume-after-eviction", { value: 42 });
+
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-across-eviction")).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: { value: 42 }
+          });
+          expect(instance.getWorkflowEvents_experimental().map((event) => event.type)).toEqual([
+            "created",
+            "started",
+            "completed"
+          ]);
+        });
+
+        expect(beforeWaitRuns).toBe(1);
+        expect(afterWaitRuns).toBe(1);
+        expect(receivedInputs.length).toBeGreaterThanOrEqual(2);
+        for (const receivedInput of receivedInputs) {
+          expect(receivedInput).toEqual(input);
+        }
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("resumes a retry from its persisted alarm after eviction", async () => {
+      let callbackRuns = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run("retry-across-eviction", async () => {
+            callbackRuns++;
+            if (callbackRuns === 1) throw new Error("transient");
+            return "recovered";
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        let retryAt = 0;
+
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "retry-across-eviction");
+              if (step?.type !== "run") return undefined;
+              const attempt = step.attempts[step.attempts.length - 1];
+              return attempt?.state === "failed" ? attempt.nextAttemptAt?.getTime() : undefined;
+            })
+            .toEqual(expect.any(Number));
+
+          const step = instance.getSteps_experimental().find((s) => s.id === "retry-across-eviction");
+          expect(step?.type).toBe("run");
+          const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          const failedAttempt = attempts[attempts.length - 1];
+          expect(failedAttempt?.state).toBe("failed");
+          if (failedAttempt?.state !== "failed" || failedAttempt.nextAttemptAt === undefined) {
+            throw new Error("Expected a retryable failed attempt.");
+          }
+          retryAt = failedAttempt.nextAttemptAt.getTime();
+          expect(await state.storage.getAlarm()).toBe(retryAt);
+        });
+
+        await evictDurableObject(stub);
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(retryAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+          await runInDurableObject(stub, async (instance) => {
+            await expect.poll(() => instance.getStatus()).toBe("completed");
+            const step = instance.getSteps_experimental().find((s) => s.id === "retry-across-eviction");
+            expect(step?.type).toBe("run");
+            const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(attempts).toHaveLength(2);
+            expect(attempts[0]).toMatchObject({ state: "failed", errorMessage: "Error: transient" });
+            expect(attempts[1]).toMatchObject({ state: "succeeded", resultJson: '"recovered"' });
+          });
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        expect(callbackRuns).toBe(2);
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("restores paused status and keeps inbound events queued across eviction", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.wait<{ value: number }>("paused-wait-across-eviction", "resume-paused-after-eviction");
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+
+        await runInDurableObject(stub, async (instance) => {
+          await instance.create();
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "paused-wait-across-eviction");
+              return step?.type === "wait" ? step.state : undefined;
+            })
+            .toBe("waiting");
+          await instance.pause();
+          expect(instance.getStatus()).toBe("paused");
+        });
+
+        await evictDurableObject(stub);
+        await stub.handleInboundEvent("resume-paused-after-eviction", { value: 42 });
+        expect(await runDurableObjectAlarm(stub)).toBe(false);
+
+        await runInDurableObject(stub, async (instance) => {
+          expect(instance.getStatus()).toBe("paused");
+          expect(instance.getSteps_experimental().find((s) => s.id === "paused-wait-across-eviction")).toMatchObject({
+            type: "wait",
+            state: "waiting"
+          });
+
+          await instance.resume();
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+          expect(instance.getSteps_experimental().find((s) => s.id === "paused-wait-across-eviction")).toMatchObject({
+            type: "wait",
+            state: "satisfied",
+            payload: { value: 42 }
+          });
+          expect(instance.getWorkflowEvents_experimental().map((event) => event.type)).toEqual([
+            "created",
+            "started",
+            "paused",
+            "resumed",
+            "completed"
+          ]);
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("resumes a persisted sleep alarm after eviction", async () => {
+      let afterSleepRuns = 0;
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.sleep("sleep-across-eviction", 1_000);
+          await this.run("after-sleep-across-eviction", async () => {
+            afterSleepRuns++;
+            return "awake";
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        let wakeAt = 0;
+
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "sleep-across-eviction");
+              return step?.type === "sleep" && step.state === "waiting" ? step.wakeAt.getTime() : undefined;
+            })
+            .toEqual(expect.any(Number));
+
+          const step = instance.getSteps_experimental().find((s) => s.id === "sleep-across-eviction");
+          expect(step?.type).toBe("sleep");
+          if (step?.type !== "sleep" || step.state !== "waiting") {
+            throw new Error("Expected a waiting sleep step.");
+          }
+          wakeAt = step.wakeAt.getTime();
+          expect(await state.storage.getAlarm()).toBe(wakeAt);
+        });
+
+        await evictDurableObject(stub);
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(wakeAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+          await runInDurableObject(stub, async (instance) => {
+            await expect.poll(() => instance.getStatus()).toBe("completed");
+            expect(instance.getSteps_experimental().find((s) => s.id === "sleep-across-eviction")).toMatchObject({
+              type: "sleep",
+              state: "elapsed",
+              resolvedAt: expect.any(Date)
+            });
+            const afterSleep = instance.getSteps_experimental().find((s) => s.id === "after-sleep-across-eviction");
+            expect(afterSleep?.type).toBe("run");
+            const attempts = (afterSleep as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(attempts).toHaveLength(1);
+            expect(attempts[0]).toMatchObject({ state: "succeeded", resultJson: '"awake"' });
+          });
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        expect(afterSleepRuns).toBe(1);
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("resumes a persisted wait timeout alarm after eviction", async () => {
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.wait("wait-timeout-across-eviction", "never-arrives", {
+            timeoutAt: Date.now() + 1_000
+          });
+        });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        let timeoutAt = 0;
+
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "wait-timeout-across-eviction");
+              return step?.type === "wait" && step.state === "waiting" ? step.timeoutAt?.getTime() : undefined;
+            })
+            .toEqual(expect.any(Number));
+
+          const step = instance.getSteps_experimental().find((s) => s.id === "wait-timeout-across-eviction");
+          expect(step?.type).toBe("wait");
+          if (step?.type !== "wait" || step.state !== "waiting" || step.timeoutAt === undefined) {
+            throw new Error("Expected a waiting wait step with a timeout.");
+          }
+          timeoutAt = step.timeoutAt.getTime();
+          expect(await state.storage.getAlarm()).toBe(timeoutAt);
+        });
+
+        await evictDurableObject(stub);
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(timeoutAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+          await runInDurableObject(stub, async (instance) => {
+            await expect.poll(() => instance.getStatus()).toBe("failed");
+            expect(instance.getSteps_experimental().find((s) => s.id === "wait-timeout-across-eviction")).toMatchObject(
+              {
+                type: "wait",
+                state: "timed_out",
+                timeoutAt: new Date(timeoutAt),
+                resolvedAt: expect.any(Date)
+              }
+            );
+            expect(instance.getWorkflowEvents_experimental().map((event) => event.type)).toEqual([
+              "created",
+              "started",
+              "failed"
+            ]);
+          });
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        await stub.handleInboundEvent("never-arrives", { late: true });
+        expect(await runDurableObjectAlarm(stub)).toBe(false);
+        await runInDurableObject(stub, async (instance, state) => {
+          expect(instance.getStatus()).toBe("failed");
+          expect(instance.getSteps_experimental().find((s) => s.id === "wait-timeout-across-eviction")).toMatchObject({
+            type: "wait",
+            state: "timed_out"
+          });
+          const inboundEventCount = state.storage.sql
+            .exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_events")
+            .one().count;
+          expect(inboundEventCount).toBe(0);
+        });
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+
+    it("uses the watchdog to recover a run attempt interrupted by forced teardown", async () => {
+      let callbackRuns = 0;
+      const firstAttemptStarted = Promise.withResolvers<void>();
+      const interruptedAttempt = Promise.withResolvers<never>();
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run(
+            "interrupted-by-teardown",
+            async () => {
+              callbackRuns++;
+              if (callbackRuns === 1) {
+                firstAttemptStarted.resolve();
+                return await interruptedAttempt.promise;
+              }
+              return "recovered";
+            },
+            { maxAttempts: 2 }
+          );
+        });
+
+      try {
+        const objectName = crypto.randomUUID();
+        let stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await firstAttemptStarted.promise;
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "interrupted-by-teardown");
+              if (step?.type !== "run") return undefined;
+              return step.attempts[step.attempts.length - 1]?.state;
+            })
+            .toBe("started");
+
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          if (watchdogAt === null) throw new Error("Expected a watchdog alarm.");
+          expect(watchdogAt).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+          expect(watchdogAt).toBeLessThanOrEqual(Date.now() + 31 * 60_000);
+        });
+
+        await abortAllDurableObjects();
+        stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        let retryAt = 0;
+        await runInDurableObject(stub, async (instance, state) => {
+          await expect
+            .poll(() => {
+              const step = instance.getSteps_experimental().find((s) => s.id === "interrupted-by-teardown");
+              if (step?.type !== "run") return undefined;
+              const attempt = step.attempts[step.attempts.length - 1];
+              return attempt?.state === "failed" ? attempt.nextAttemptAt?.getTime() : undefined;
+            })
+            .toEqual(expect.any(Number));
+
+          const step = instance.getSteps_experimental().find((s) => s.id === "interrupted-by-teardown");
+          expect(step?.type).toBe("run");
+          const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+          const failedAttempt = attempts[attempts.length - 1];
+          expect(failedAttempt?.state).toBe("failed");
+          if (failedAttempt?.state !== "failed" || failedAttempt.nextAttemptAt === undefined) {
+            throw new Error("Expected an interrupted attempt with a scheduled retry.");
+          }
+          retryAt = failedAttempt.nextAttemptAt.getTime();
+          expect(await state.storage.getAlarm()).toBe(retryAt);
+        });
+
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(retryAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+
+          await runInDurableObject(stub, async (instance) => {
+            await expect.poll(() => instance.getStatus()).toBe("completed");
+            const step = instance.getSteps_experimental().find((s) => s.id === "interrupted-by-teardown");
+            expect(step?.type).toBe("run");
+            const attempts = (step as RunStep & { attempts: RunStepAttempt[] }).attempts;
+            expect(attempts).toHaveLength(2);
+            expect(attempts[0]).toMatchObject({
+              state: "failed",
+              errorMessage: "Step execution was interrupted before its outcome was durably recorded.",
+              nextAttemptAt: expect.any(Date)
+            });
+            expect(attempts[1]).toMatchObject({ state: "succeeded", resultJson: '"recovered"' });
+          });
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        expect(callbackRuns).toBe(2);
+      } finally {
+        executeSpy.mockRestore();
+      }
+    });
+  });
+
   it("fails when the same step id is reused across run steps in one execution", async () => {
     const executeSpy = vi
       .spyOn(TestWorkflowDefinition.prototype, "execute")
@@ -43,7 +454,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -67,7 +478,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -91,7 +502,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -131,7 +542,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -165,7 +576,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -196,7 +607,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -232,7 +643,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -263,7 +674,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -306,7 +717,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -347,7 +758,7 @@ describe("WorkflowRuntime", () => {
         const input = { key: "value", n: 42 };
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -378,7 +789,7 @@ describe("WorkflowRuntime", () => {
         await runInDurableObject(stub, async (instance) => {
           const { resolve: resolveRunning, promise: running } = Promise.withResolvers<WorkflowStatus>();
           const { resolve: resolveDone, promise: done } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") {
               resolveRunning(status);
             } else {
@@ -418,7 +829,7 @@ describe("WorkflowRuntime", () => {
         await runInDurableObject(stub, async (instance) => {
           const { resolve: resolveRunning, promise: running } = Promise.withResolvers<WorkflowStatus>();
           const { resolve: resolveDone, promise: done } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") {
               resolveRunning(status);
             } else {
@@ -447,7 +858,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -476,7 +887,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -514,7 +925,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -556,7 +967,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -597,7 +1008,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -633,7 +1044,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -667,7 +1078,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -721,7 +1132,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -768,7 +1179,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (instance) => {
             const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-            instance.onStatusChange_experimental = async (status) => {
+            instance.onStatusChange = (status) => {
               if (status === "running") return;
               resolve(status);
             };
@@ -810,7 +1221,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (instance) => {
             const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-            instance.onStatusChange_experimental = async (status) => {
+            instance.onStatusChange = (status) => {
               if (status === "running") return;
               resolve(status);
             };
@@ -853,7 +1264,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (instance) => {
             const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-            instance.onStatusChange_experimental = async (status) => {
+            instance.onStatusChange = (status) => {
               if (status === "running") return;
               resolve(status);
             };
@@ -893,7 +1304,7 @@ describe("WorkflowRuntime", () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
           await runInDurableObject(stub, async (instance) => {
             const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-            instance.onStatusChange_experimental = async (status) => {
+            instance.onStatusChange = (status) => {
               if (status === "running") return;
               resolve(status);
             };
@@ -943,7 +1354,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -982,7 +1393,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1026,7 +1437,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const terminalStatuses: WorkflowStatus[] = [];
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             terminalStatuses.push(status);
           };
@@ -1062,11 +1473,17 @@ describe("WorkflowRuntime", () => {
 
   describe("Promise.all", () => {
     it("propagates SuspendWorkflowError so the workflow stays running with a waiting step", async () => {
+      const runStarted = Promise.withResolvers<void>();
+      const releaseRun = Promise.withResolvers<void>();
       const executeSpy = vi
         .spyOn(TestWorkflowDefinition.prototype, "execute")
         .mockImplementation(async function (this: TestWorkflowDefinition) {
           await Promise.all([
-            this.run("parallel-run", async () => 1),
+            this.run("parallel-run", async () => {
+              runStarted.resolve();
+              await releaseRun.promise;
+              return 1;
+            }),
             this.wait("parallel-wait", "parallel-event", {
               timeoutAt: Date.now() + 86_400_000
             })
@@ -1076,12 +1493,13 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const terminalStatuses: WorkflowStatus[] = [];
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             terminalStatuses.push(status);
           };
 
           await instance.create();
+          await runStarted.promise;
           await expect.poll(() => instance.getStatus()).toBe("running");
           expect(terminalStatuses).toHaveLength(0);
 
@@ -1097,13 +1515,16 @@ describe("WorkflowRuntime", () => {
             type: "wait",
             state: "waiting"
           });
-          // `wait()` usually wins the race; the run branch can still be mid-flight so the latest attempt may still be in flight.
+
           const parRun = steps.find((s) => s.id === "parallel-run");
           expect(parRun?.type).toBe("run");
           const paa = (parRun as RunStep & { attempts: RunStepAttempt[] }).attempts;
           expect(paa[paa.length - 1]).toMatchObject({ state: "started" });
+          expect(instance.getStatus()).toBe("running");
+          expect(terminalStatuses).toHaveLength(0);
         });
       } finally {
+        releaseRun.resolve();
         executeSpy.mockRestore();
       }
     });
@@ -1114,7 +1535,7 @@ describe("WorkflowRuntime", () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
       await runInDurableObject(stub, async (instance) => {
         const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-        instance.onStatusChange_experimental = async (status) => {
+        instance.onStatusChange = (status) => {
           if (status === "running") return;
           resolve(status);
         };
@@ -1133,7 +1554,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1189,7 +1610,7 @@ describe("WorkflowRuntime", () => {
       }
     });
 
-    it("pause() fires onStatusChange_experimental with 'paused'", async () => {
+    it("pause() fires onStatusChange with 'paused'", async () => {
       const executeSpy = vi
         .spyOn(TestWorkflowDefinition.prototype, "execute")
         .mockImplementation(async function (this: TestWorkflowDefinition) {
@@ -1200,7 +1621,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<void>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "paused") resolve();
           };
 
@@ -1256,7 +1677,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running" || status === "paused") return;
             resolve(status);
           };
@@ -1354,7 +1775,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running" || status === "paused") return;
             resolve(status);
           };
@@ -1434,7 +1855,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance, state) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1468,6 +1889,8 @@ describe("WorkflowRuntime", () => {
           expect(rows[0]!.claimed_by).toBe("wait-inbound-row");
           expect(JSON.parse(rows[0]!.payload)).toEqual({ trace: "x" });
         });
+
+        expect(await runDurableObjectAlarm(stub)).toBe(false);
       } finally {
         executeSpy.mockRestore();
       }
@@ -1485,7 +1908,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1533,7 +1956,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1581,7 +2004,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running" || status === "paused") return;
             resolve(status);
           };
@@ -1631,7 +2054,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1673,7 +2096,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -1722,7 +2145,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running" || status === "paused") return;
             resolve(status);
           };
@@ -1754,7 +2177,7 @@ describe("WorkflowRuntime", () => {
         const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
         await runInDurableObject(stub, async (instance) => {
           const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
-          instance.onStatusChange_experimental = async (status) => {
+          instance.onStatusChange = (status) => {
             if (status === "running") return;
             resolve(status);
           };
@@ -2075,21 +2498,48 @@ describe("WorkflowRuntime", () => {
           });
         });
 
-        it("records next_attempt_at when retries remain", async () => {
+        it("records the retry backoff sequence and caps subsequent delays", async () => {
           const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
-          await runInDurableObject(stub, async (_instance, state) => {
-            const context = new WorkflowRuntimeContext(state.storage);
-            const before = Date.now();
-            context.getOrCreateRunStep(createRunStepId("step-1"), { parentStepId: null });
-            context.handleRunAttemptStarted(createRunStepId("step-1"));
-            const failed = context.handleRunAttemptFailed(createRunStepId("step-1"), { errorMessage: "transient" });
-            const after = Date.now();
-            expect(failed.state).toBe("failed");
-            if (failed.state !== "failed") throw new Error("expected failed");
-            expect(failed.nextAttemptAt).toBeDefined();
-            expect(failed.nextAttemptAt!.getTime()).toBeGreaterThanOrEqual(before + 250);
-            expect(failed.nextAttemptAt!.getTime()).toBeLessThanOrEqual(after + 500 + 100);
-          });
+          const now = Date.now();
+          const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+          try {
+            await runInDurableObject(stub, async (_instance, state) => {
+              const context = new WorkflowRuntimeContext(state.storage);
+              const stepId = createRunStepId("step-1");
+              context.getOrCreateRunStep(stepId, { maxAttempts: 10, parentStepId: null });
+
+              const backoffs = [250, 500, 1_000, 2_000, 4_000, 8_000, 10_000, 10_000, 10_000];
+              for (const [index, backoff] of backoffs.entries()) {
+                context.handleRunAttemptStarted(stepId);
+                // These direct context calls bypass alarm delays. Give each row a unique durable timestamp so the
+                // storage ordering is deterministic even though attempt ids are random.
+                state.storage.sql.exec(
+                  "UPDATE run_step_attempts SET started_at = ? WHERE step_id = ? AND state = 'started'",
+                  now - 1_000 + index,
+                  stepId
+                );
+                const failed = context.handleRunAttemptFailed(stepId, { errorMessage: "transient" });
+                expect(failed).toMatchObject({
+                  state: "failed",
+                  nextAttemptAt: new Date(now + backoff)
+                });
+              }
+
+              context.handleRunAttemptStarted(stepId);
+              state.storage.sql.exec(
+                "UPDATE run_step_attempts SET started_at = ? WHERE step_id = ? AND state = 'started'",
+                now - 1_000 + backoffs.length,
+                stepId
+              );
+              expect(context.handleRunAttemptFailed(stepId, { errorMessage: "terminal" })).toMatchObject({
+                state: "failed",
+                nextAttemptAt: undefined
+              });
+              expect(context.getOrCreateRunStep(stepId, { parentStepId: null }).attempts).toHaveLength(10);
+            });
+          } finally {
+            dateNowSpy.mockRestore();
+          }
         });
 
         it("marks terminal failed when isNonRetryableStepError is true", async () => {

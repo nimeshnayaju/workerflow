@@ -95,7 +95,7 @@ New instances start in **`pending`**. The first **`create()`** call moves the in
 
 ### Experimental introspection
 
-For dashboards and debugging, the runtime exposes **`getSteps_experimental()`** and **`getWorkflowEvents_experimental()`**. The optional lifecycle hook is **`onStatusChange_experimental`** (see [Keeping workflow execution separate from state projection](#keeping-workflow-execution-separate-from-state-projection)). These names are marked experimental because they may change as the API hardens.
+For dashboards and debugging, the runtime exposes **`getSteps_experimental()`** and **`getWorkflowEvents_experimental()`**. These names are marked experimental because they may change as the API hardens.
 
 ## How it works
 
@@ -227,18 +227,9 @@ export class MyWorkflow extends WorkflowEntrypoint {
 
 This looks reasonable at first, but it creates an important failure-mode problem. If the actual business steps all succeed, but the final “sync success” step fails, then the workflow as a whole is now treated as failed. At that point, workflow execution and application-state projection have become tightly coupled, even though they are not really the same concern.
 
-I think a cleaner design is to keep synchronization logic out of workflow steps entirely. Instead, the runtime can expose a lifecycle hook that fires when workflow status changes, and synchronization can happen there.
+I think a cleaner design is to keep synchronization logic out of workflow steps entirely. Projection mechanisms can consume workflow status and events independently, for example through a scheduled reconciliation job that polls workflow state and replays missed updates.
 
-```ts
-export class MyWorkflowRuntime extends WorkflowRuntime {
-  async onStatusChange_experimental(status: "running" | "paused" | "completed" | "failed" | "cancelled") {
-    // Update your database, or push to a queue for streaming.
-    // Note: the hook is also invoked with "running" when leaving initialized/paused into running.
-  }
-}
-```
-
-That design keeps synchronization off the critical path of workflow completion. If the synchronization fails, that failure does not retroactively redefine the workflow’s business outcome. You can recover independently, for example by retrying asynchronously or running a scheduled reconciliation job that polls workflow state and replays missed updates.
+That design keeps synchronization off the critical path of workflow completion. If synchronization fails, that failure does not retroactively redefine the workflow’s business outcome, and projection can recover independently.
 
 That is not the only valid approach, but I think it produces a better separation of concerns: the workflow runtime determines workflow outcome, and projection mechanisms consume that outcome.
 

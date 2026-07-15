@@ -1,7 +1,7 @@
 {
   "name": "workerflow",
   "description": "Durable execution engine, built on Cloudflare Workers",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "type": "module",
   "exports": {
     ".": {
@@ -13,17 +13,21 @@
       "import": "./dist/definition.js"
     }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsx ./scripts/build.ts",
     "test": "vitest run",
     "test:watch": "vitest watch",
+    "typecheck": "tsc -p tsconfig.json && tsc -p test/tsconfig.json",
     "format": "oxfmt --write .",
     "format:check": "oxfmt --check .",
     "lint": "oxlint src/"
   },
   "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.14.1",
-    "@cloudflare/workers-types": "^4.20260402.1",
+    "@cloudflare/vitest-pool-workers": "^0.18.5",
+    "@cloudflare/workers-types": "^5.20260715.1",
     "oxfmt": "^0.43.0",
     "oxlint": "^1.58.0",
     "tsdown": "^0.21.7",

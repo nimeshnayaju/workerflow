@@ -12,13 +12,12 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
   #definitionInput: TInput | undefined;
 
   /**
+   * A callback that is called when the status of the workflow changes.
+   *
    * @param status - The new status of the workflow; one of "running", "paused", "completed", "failed", or "cancelled".
    * @internal
-   * A callback that is called when the status of the workflow changes.
    */
-  async onStatusChange_experimental?(
-    status: "running" | "paused" | "completed" | "failed" | "cancelled"
-  ): Promise<void>;
+  protected onStatusChange?(status: "running" | "paused" | "completed" | "failed" | "cancelled"): void;
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = this.ctx.storage.sql;
@@ -253,12 +252,11 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
   async cancel(reason?: string): Promise<void> {
     if (this.isTerminalStatus(this.#status)) return;
 
-    this.#setStatus({ type: "cancelled", reason });
-    await this.ctx.storage.deleteAlarm();
-
-    if (this.onStatusChange_experimental !== undefined) {
-      await this.onStatusChange_experimental("cancelled");
-    }
+    await this.ctx.storage.transaction(async (transaction) => {
+      this.#setStatus({ type: "cancelled", reason });
+      await transaction.deleteAlarm();
+    });
+    this.onStatusChange?.("cancelled");
   }
 
   /**
@@ -272,10 +270,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
       this.#setStatus({ type: "paused" });
       await transaction.deleteAlarm();
     });
-
-    if (this.onStatusChange_experimental !== undefined) {
-      await this.onStatusChange_experimental("paused");
-    }
+    this.onStatusChange?.("paused");
   }
 
   /**
@@ -288,10 +283,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     }
 
     this.#setStatus({ type: "running" });
-
-    if (this.onStatusChange_experimental !== undefined) {
-      await this.onStatusChange_experimental("running");
-    }
+    this.onStatusChange?.("running");
 
     await this.run();
   }
@@ -360,10 +352,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
     if (this.#status !== "running") {
       this.#setStatus({ type: "running" });
-
-      if (this.onStatusChange_experimental !== undefined) {
-        await this.onStatusChange_experimental("running");
-      }
+      this.onStatusChange?.("running");
     }
 
     if (this.#isRunLoopActive) return;
@@ -431,9 +420,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
                 this.#setStatus({ type: result.status });
                 await transaction.deleteAlarm();
               });
-              if (this.onStatusChange_experimental !== undefined) {
-                await this.onStatusChange_experimental(result.status);
-              }
+              this.onStatusChange?.(result.status);
               break;
             }
 
@@ -474,10 +461,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
               this.#setStatus({ type: "failed" });
               await transaction.deleteAlarm();
             });
-
-            if (this.onStatusChange_experimental !== undefined) {
-              await this.onStatusChange_experimental("failed");
-            }
+            this.onStatusChange?.("failed");
           }
         }
       } finally {
