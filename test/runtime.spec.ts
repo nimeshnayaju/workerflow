@@ -10,7 +10,7 @@ import {
   type WaitStepId,
   type WorkflowStatus
 } from "../src/runtime";
-import { TestWorkflowDefinition } from "./worker";
+import { TestCompletionWorkflowRuntime, TestWorkflowDefinition } from "./worker";
 import { NonRetryableStepError } from "../src/definition";
 
 function createRunStepId(id: string): RunStepId {
@@ -22,6 +22,14 @@ function createSleepStepId(id: string): SleepStepId {
 function createWaitStepId(id: string): WaitStepId {
   return id as WaitStepId;
 }
+
+type WorkflowEventDeliveryRow = {
+  event_id: number;
+  attempts: number;
+  next_attempt_at: number;
+  delivered_at: number | null;
+  last_error: string | null;
+};
 
 describe("WorkflowRuntime", () => {
   it("constructor() initializes the database and sets the status to pending", async () => {
@@ -1526,6 +1534,277 @@ describe("WorkflowRuntime", () => {
       } finally {
         releaseRun.resolve();
         executeSpy.mockRestore();
+      }
+    });
+  });
+
+  describe("completion()", () => {
+    it("does not create a delivery or alarm when the runtime has no completion handler", async () => {
+      const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+
+      await runInDurableObject(stub, async (instance, state) => {
+        const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+        instance.onStatusChange = (status) => {
+          if (status !== "running") resolve(status);
+        };
+
+        await instance.create();
+        await expect(promise).resolves.toBe("completed");
+
+        expect(state.storage.sql.exec("SELECT event_id FROM workflow_event_deliveries").toArray()).toHaveLength(0);
+        expect(await state.storage.getAlarm()).toBeNull();
+      });
+    });
+
+    it("delivers and acknowledges a completed workflow outcome", async () => {
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
+      const completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+        .mockImplementation(async (event) => {
+          receivedEvents.push(event);
+        });
+
+      try {
+        const stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        const input = { orderId: "order-123", amount: 42 };
+
+        await runInDurableObject(stub, async (instance, state) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange = (status) => {
+            if (status !== "running") resolve(status);
+          };
+
+          await instance.create(input);
+          await expect(promise).resolves.toBe("completed");
+          await expect.poll(() => receivedEvents.length).toBe(1);
+
+          const workflowEvent = state.storage.sql
+            .exec<{ id: number; recorded_at: number }>(
+              "SELECT id, recorded_at FROM workflow_events WHERE type = 'completed'"
+            )
+            .one();
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          const received = receivedEvents[0]!;
+
+          expect(received).toEqual({
+            id: `${state.id.toString()}:${workflowEvent.id}`,
+            status: "completed",
+            finishedAt: new Date(workflowEvent.recorded_at)
+          });
+          expect(delivery).toMatchObject({
+            event_id: workflowEvent.id,
+            attempts: 1,
+            last_error: null
+          });
+          expect(delivery.delivered_at).toEqual(expect.any(Number));
+          expect(await state.storage.getAlarm()).toBeNull();
+
+          await instance.create(input);
+          expect(receivedEvents).toHaveLength(1);
+          expect(state.storage.sql.exec("SELECT event_id FROM workflow_event_deliveries").toArray()).toHaveLength(1);
+        });
+      } finally {
+        completionSpy.mockRestore();
+      }
+    });
+
+    it("keeps the workflow completed and retries a rejected delivery after eviction", async () => {
+      const receivedEventIds: string[] = [];
+      const completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+        .mockImplementation(async (event) => {
+          receivedEventIds.push(event.id);
+          if (receivedEventIds.length === 1) throw new Error("projection unavailable");
+        });
+
+      try {
+        const stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        let retryAt = 0;
+
+        await runInDurableObject(stub, async (instance, state) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange = (status) => {
+            if (status !== "running") resolve(status);
+          };
+
+          await instance.create({ workflow: "retry-completion" });
+          await expect(promise).resolves.toBe("completed");
+          await expect.poll(() => receivedEventIds.length).toBe(1);
+
+          expect(instance.getStatus()).toBe("completed");
+          expect(instance.getWorkflowEvents_experimental().map((event) => event.type)).toEqual([
+            "created",
+            "started",
+            "completed"
+          ]);
+
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          expect(delivery).toMatchObject({
+            attempts: 1,
+            delivered_at: null,
+            last_error: "Error: projection unavailable"
+          });
+          retryAt = delivery.next_attempt_at;
+          expect(await state.storage.getAlarm()).toBe(retryAt);
+        });
+
+        await evictDurableObject(stub);
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(retryAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        await runInDurableObject(stub, async (instance, state) => {
+          expect(instance.getStatus()).toBe("completed");
+          expect(receivedEventIds).toHaveLength(2);
+          expect(new Set(receivedEventIds).size).toBe(1);
+
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          expect(delivery.attempts).toBe(2);
+          expect(delivery.delivered_at).toEqual(expect.any(Number));
+          expect(delivery.last_error).toBeNull();
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        completionSpy.mockRestore();
+      }
+    });
+
+    it("redelivers after forced teardown while the completion handler is still running", async () => {
+      const firstDeliveryStarted = Promise.withResolvers<void>();
+      const interruptedDelivery = Promise.withResolvers<never>();
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
+      const completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+        .mockImplementation(async (event) => {
+          receivedEvents.push(event);
+          if (receivedEvents.length === 1) {
+            firstDeliveryStarted.resolve();
+            return await interruptedDelivery.promise;
+          }
+        });
+
+      try {
+        const objectName = crypto.randomUUID();
+        let stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(objectName);
+        let visibilityTimeoutAt = 0;
+        const input = { workflow: "interrupted-completion" };
+
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create(input);
+          await firstDeliveryStarted.promise;
+
+          expect(instance.getStatus()).toBe("completed");
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          expect(delivery.attempts).toBe(1);
+          expect(delivery.delivered_at).toBeNull();
+          visibilityTimeoutAt = delivery.next_attempt_at;
+          expect(await state.storage.getAlarm()).toBe(visibilityTimeoutAt);
+        });
+
+        await abortAllDurableObjects();
+        stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(objectName);
+
+        const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(visibilityTimeoutAt);
+        try {
+          expect(await runDurableObjectAlarm(stub)).toBe(true);
+        } finally {
+          dateNowSpy.mockRestore();
+        }
+
+        expect(receivedEvents).toHaveLength(2);
+        expect(receivedEvents[1]).toEqual(receivedEvents[0]);
+        expect(receivedEvents[1]?.status).toBe("completed");
+
+        await runInDurableObject(stub, async (instance, state) => {
+          expect(instance.getStatus()).toBe("completed");
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          expect(delivery.attempts).toBe(2);
+          expect(delivery.delivered_at).toEqual(expect.any(Number));
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        completionSpy.mockRestore();
+      }
+    });
+
+    it("delivers failed and cancelled workflow outcomes", async () => {
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
+      const completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+        .mockImplementation(async (event) => {
+          receivedEvents.push(event);
+        });
+      const executeSpy = vi.spyOn(TestWorkflowDefinition.prototype, "execute").mockImplementation(async () => {
+        throw new Error("fatal workflow error");
+      });
+
+      try {
+        const failedStub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(failedStub, async (instance, state) => {
+          const { resolve, promise } = Promise.withResolvers<WorkflowStatus>();
+          instance.onStatusChange = (status) => {
+            if (status !== "running") resolve(status);
+          };
+
+          await instance.create();
+          await expect(promise).resolves.toBe("failed");
+          await expect.poll(() => receivedEvents.length).toBe(1);
+
+          const workflowEvent = state.storage.sql
+            .exec<{ id: number; recorded_at: number }>(
+              "SELECT id, recorded_at FROM workflow_events WHERE type = 'failed'"
+            )
+            .one();
+          expect(receivedEvents[0]).toEqual({
+            id: `${state.id.toString()}:${workflowEvent.id}`,
+            status: "failed",
+            finishedAt: new Date(workflowEvent.recorded_at)
+          });
+          expect(
+            state.storage.sql.exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries").one()
+              .delivered_at
+          ).toEqual(expect.any(Number));
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+
+        const cancelledStub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(cancelledStub, async (instance, state) => {
+          await instance.cancel("not needed");
+
+          const workflowEvent = state.storage.sql
+            .exec<{ id: number; recorded_at: number }>(
+              "SELECT id, recorded_at FROM workflow_events WHERE type = 'cancelled'"
+            )
+            .one();
+          expect(receivedEvents[1]).toEqual({
+            id: `${state.id.toString()}:${workflowEvent.id}`,
+            status: "cancelled",
+            finishedAt: new Date(workflowEvent.recorded_at)
+          });
+          expect(
+            state.storage.sql.exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries").one()
+              .delivered_at
+          ).toEqual(expect.any(Number));
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+
+        expect(completionSpy).toHaveBeenCalledTimes(2);
+      } finally {
+        executeSpy.mockRestore();
+        completionSpy.mockRestore();
       }
     });
   });

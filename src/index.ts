@@ -1,2 +1,2 @@
 export { WorkflowDefinition, NonRetryableStepError } from "./definition";
-export { WorkflowRuntime } from "./runtime";
+export { WorkflowRuntime, type WorkflowCompletionEvent } from "./runtime";

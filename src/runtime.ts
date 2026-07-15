@@ -2,10 +2,11 @@ import { DurableObject, RpcTarget } from "cloudflare:workers";
 import type { WorkflowDefinition } from "./definition";
 import type { Json } from "./json";
 import mig000 from "./migrations/0000_initial";
+import mig001 from "./migrations/0001_workflow_event_deliveries";
 import type { Brand } from "./brand";
 
 export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | undefined> extends DurableObject {
-  private static readonly MIGRATIONS = [mig000];
+  private static readonly MIGRATIONS = [mig000, mig001];
   private readonly sql: SqlStorage;
   #status: WorkflowStatus;
   #isRunLoopActive: boolean = false;
@@ -18,6 +19,16 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
    * @internal
    */
   protected onStatusChange?(status: "running" | "paused" | "completed" | "failed" | "cancelled"): void;
+
+  /**
+   * Handles a durably delivered terminal workflow outcome.
+   *
+   * Defining this method opts the runtime into delivery for completed, failed, and cancelled workflows. Returning
+   * acknowledges the event; throwing causes it to be retried. Delivery is at least once, so implementations must use
+   * `event.id` to make side effects idempotent.
+   */
+  protected completion?(event: WorkflowCompletionEvent): Promise<void>;
+
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
     this.sql = this.ctx.storage.sql;
@@ -68,8 +79,8 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
       | { type: "completed" }
       | { type: "failed" }
       | { type: "cancelled"; reason?: string }
-  ): void {
-    if (this.#status === data.type) return;
+  ): WorkflowEventRow | undefined {
+    if (this.#status === data.type) return undefined;
 
     let eventType: "started" | "resumed" | "paused" | "completed" | "failed" | "cancelled";
     switch (data.type) {
@@ -92,13 +103,15 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
       data.type
     );
 
-    this.sql.exec(
-      `INSERT INTO workflow_events (type, cancellation_reason) VALUES (?, ?)`,
-      eventType,
-      data.type === "cancelled" ? (data.reason ?? null) : null
-    );
+    const event = this.sql
+      .exec<WorkflowEventRow>(
+        `INSERT INTO workflow_events (type, cancellation_reason) VALUES (?, ?) RETURNING *`,
+        eventType,
+        data.type === "cancelled" ? (data.reason ?? null) : null
+      )
+      .one();
 
-    this.#status = data.type;
+    return event;
   }
 
   /**
@@ -253,10 +266,24 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     if (this.isTerminalStatus(this.#status)) return;
 
     await this.ctx.storage.transaction(async (transaction) => {
-      this.#setStatus({ type: "cancelled", reason });
-      await transaction.deleteAlarm();
+      const event = this.#setStatus({ type: "cancelled", reason });
+      if (event?.type === "cancelled" && this.completion !== undefined) {
+        const deliverAt = Date.now();
+        this.sql.exec(
+          `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
+          event.id,
+          deliverAt
+        );
+        await transaction.setAlarm(deliverAt);
+      } else {
+        await transaction.deleteAlarm();
+      }
     });
+    this.#status = "cancelled";
     this.onStatusChange?.("cancelled");
+    if (this.completion !== undefined) {
+      await this.deliverCompletion();
+    }
   }
 
   /**
@@ -270,6 +297,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
       this.#setStatus({ type: "paused" });
       await transaction.deleteAlarm();
     });
+    this.#status = "paused";
     this.onStatusChange?.("paused");
   }
 
@@ -283,14 +311,131 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     }
 
     this.#setStatus({ type: "running" });
+    this.#status = "running";
     this.onStatusChange?.("running");
 
     await this.run();
   }
 
+  private async deliverCompletion(): Promise<void> {
+    const now = Date.now();
+
+    const delivery = await this.ctx.storage.transaction(async (transaction) => {
+      const [pending] = this.sql
+        .exec<CompletionDelivery_Row>(
+          `SELECT d.event_id, d.attempts, e.recorded_at, e.type
+           FROM workflow_event_deliveries AS d
+           JOIN workflow_events AS e ON e.id = d.event_id
+           WHERE e.type IN ('completed', 'failed', 'cancelled')
+             AND d.delivered_at IS NULL
+             AND d.next_attempt_at <= ?
+           ORDER BY d.event_id ASC
+           LIMIT 1`,
+          now
+        )
+        .toArray();
+
+      if (pending === undefined) {
+        const [next] = this.sql
+          .exec<{ next_attempt_at: number }>(
+            `SELECT next_attempt_at
+             FROM workflow_event_deliveries
+             WHERE delivered_at IS NULL
+             ORDER BY next_attempt_at ASC
+             LIMIT 1`
+          )
+          .toArray();
+
+        if (next === undefined) {
+          await transaction.deleteAlarm();
+        } else {
+          await transaction.setAlarm(next.next_attempt_at);
+        }
+        return undefined;
+      }
+
+      // Moving next_attempt_at into the future acts as a visibility lease. If the object is evicted after the user's
+      // side effect but before acknowledgement, the alarm makes the same event eligible for another delivery.
+      const leaseExpiresAt = now + 30 * 60 * 1000;
+      const { attempts } = this.sql
+        .exec<{ attempts: number }>(
+          `UPDATE workflow_event_deliveries
+           SET attempts = attempts + 1,
+               next_attempt_at = ?,
+               last_error = NULL
+           WHERE event_id = ?
+           RETURNING attempts`,
+          leaseExpiresAt,
+          pending.event_id
+        )
+        .one();
+      await transaction.setAlarm(leaseExpiresAt);
+
+      const workflowInstanceId = this.ctx.id.toString();
+      return {
+        eventId: pending.event_id,
+        attempts,
+        event: {
+          id: `${workflowInstanceId}:${pending.event_id}`,
+          status: pending.type,
+          finishedAt: new Date(pending.recorded_at)
+        }
+      };
+    });
+
+    if (delivery === undefined) return;
+
+    try {
+      if (this.completion === undefined) {
+        throw new Error(
+          "A workflow completion delivery is pending, but the runtime no longer defines a completion handler."
+        );
+      }
+
+      await this.completion(delivery.event);
+
+      await this.ctx.storage.transaction(async (transaction) => {
+        this.sql.exec(
+          `UPDATE workflow_event_deliveries
+           SET delivered_at = CAST(unixepoch('subsecond') * 1000 AS INTEGER),
+               last_error = NULL
+           WHERE event_id = ?
+             AND delivered_at IS NULL`,
+          delivery.eventId
+        );
+        await transaction.deleteAlarm();
+      });
+    } catch (error) {
+      const retryDelay = Math.min(60 * 60 * 1000, 1_000 * 2 ** Math.min(delivery.attempts - 1, 12));
+      const retryAt = Date.now() + retryDelay;
+      const formattedError = error instanceof Error ? error : new Error(String(error));
+
+      await this.ctx.storage.transaction(async (transaction) => {
+        this.sql.exec(
+          `UPDATE workflow_event_deliveries
+           SET next_attempt_at = ?,
+               last_error = ?
+           WHERE event_id = ?
+             AND delivered_at IS NULL`,
+          retryAt,
+          String(formattedError),
+          delivery.eventId
+        );
+        await transaction.setAlarm(retryAt);
+      });
+
+      console.error(formattedError, {
+        workflowCompletionEventId: delivery.event.id,
+        attempt: delivery.attempts
+      });
+    }
+  }
+
   async alarm(_info?: AlarmInvocationInfo): Promise<void> {
-    // If the workflow is in a terminal state (completed, failed, or cancelled), we do not need to continue the execution.
-    if (this.isTerminalStatus(this.#status)) return;
+    if (this.isTerminalStatus(this.#status)) {
+      await this.deliverCompletion();
+      return;
+    }
 
     // If the workflow is paused, do not continue execution.
     if (this.#status === "paused") return;
@@ -352,6 +497,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
     if (this.#status !== "running") {
       this.#setStatus({ type: "running" });
+      this.#status = "running";
       this.onStatusChange?.("running");
     }
 
@@ -404,7 +550,6 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
             // If the workflow was cancelled while waiting for the executor to return a response, we exit the loop immediately.
             if (this.#status === "cancelled") {
-              await this.ctx.storage.deleteAlarm();
               break;
             }
 
@@ -417,10 +562,24 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
             if (result.done) {
               await this.ctx.storage.transaction(async (transaction) => {
-                this.#setStatus({ type: result.status });
-                await transaction.deleteAlarm();
+                const event = this.#setStatus({ type: result.status });
+                if (event !== undefined && this.completion !== undefined) {
+                  const deliverAt = Date.now();
+                  this.sql.exec(
+                    `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
+                    event.id,
+                    deliverAt
+                  );
+                  await transaction.setAlarm(deliverAt);
+                } else {
+                  await transaction.deleteAlarm();
+                }
               });
+              this.#status = result.status;
               this.onStatusChange?.(result.status);
+              if (this.completion !== undefined) {
+                await this.deliverCompletion();
+              }
               break;
             }
 
@@ -458,10 +617,24 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
             // All other errors are considered to be fatal and the workflow should be aborted.
             await this.ctx.storage.transaction(async (transaction) => {
-              this.#setStatus({ type: "failed" });
-              await transaction.deleteAlarm();
+              const event = this.#setStatus({ type: "failed" });
+              if (event?.type === "failed" && this.completion !== undefined) {
+                const deliverAt = Date.now();
+                this.sql.exec(
+                  `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
+                  event.id,
+                  deliverAt
+                );
+                await transaction.setAlarm(deliverAt);
+              } else {
+                await transaction.deleteAlarm();
+              }
             });
+            this.#status = "failed";
             this.onStatusChange?.("failed");
+            if (this.completion !== undefined) {
+              await this.deliverCompletion();
+            }
           }
         }
       } finally {
@@ -1060,6 +1233,25 @@ function formatSatisfiedWaitStep<T extends Json | undefined>(
     timeoutAt: step.timeout_at != null ? new Date(step.timeout_at) : undefined
   };
 }
+
+/**
+ * A durably delivered notification that a workflow reached a terminal status.
+ *
+ * The same event can be delivered more than once. `id` is stable across attempts and should be used as the idempotency
+ * key for side effects performed by the completion handler.
+ */
+export type WorkflowCompletionEvent = {
+  id: string;
+  status: "completed" | "failed" | "cancelled";
+  finishedAt: Date;
+};
+
+type CompletionDelivery_Row = {
+  event_id: number;
+  attempts: number;
+  recorded_at: number;
+  type: WorkflowCompletionEvent["status"];
+};
 
 /**
  * SQLite row shape for `workflow_events` (append-only workflow status transitions).

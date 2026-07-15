@@ -20,6 +20,10 @@ export default defineConfig({
           TEST_WORKFLOW_RUNTIME: {
             className: "TestWorkflowRuntime",
             useSQLite: true
+          },
+          TEST_COMPLETION_WORKFLOW_RUNTIME: {
+            className: "TestCompletionWorkflowRuntime",
+            useSQLite: true
           }
         }
       }

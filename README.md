@@ -37,10 +37,16 @@ In your Worker module, export the runtime, the definition, and a **`fetch`** han
 
 ```ts
 // src/worker.ts
-import { WorkflowDefinition, WorkflowRuntime } from "workerflow";
+import { WorkflowDefinition, WorkflowRuntime, type WorkflowCompletionEvent } from "workerflow";
 
 export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
   protected readonly definition = this.ctx.exports.OrderWorkflowDefinition;
+
+  protected async completion(event: WorkflowCompletionEvent): Promise<void> {
+    // Completion delivery is at least once. Use event.id as the idempotency key
+    // when updating another database or calling an external API.
+    console.log("Order workflow finished", event);
+  }
 }
 
 export class OrderWorkflowDefinition extends WorkflowDefinition<{ orderId: string }> {
@@ -89,9 +95,25 @@ From the Durable Object stub you can:
 - **`create(input)`** — Pins the workflow input in SQLite the **first** time the instance is initialized, then starts execution. The input argument is required unless **`TInput`** includes **`undefined`**. **No-op** if the workflow is already **completed**, **failed**, **cancelled**, or **paused**.
 - **`pause()`** — When status is **running**, moves to **paused**, clears alarms, and stops driving **`execute()`** until **`resume()`**. Inbound events are queued and applied when a matching **`wait`** runs again after resume.
 - **`resume()`** — When status is **paused**, moves to **running** and continues the loop. Throws if the workflow is not paused.
-- **`cancel(reason?)`** — Moves to terminal **cancelled** and clears alarms.
+- **`cancel(reason?)`** — Moves to terminal **cancelled** and stops workflow execution. If the runtime defines **`completion`**, it schedules an alarm for durable completion delivery; otherwise it clears the current alarm.
 
 New instances start in **`pending`**. The first **`create()`** call moves the instance through the durable **`initialized`** state before execution enters **`running`**.
+
+### Completion handler
+
+Define the optional protected **`completion(event)`** method on the runtime to consume terminal workflow outcomes:
+
+```ts
+type WorkflowCompletionEvent = {
+  id: string;
+  status: "completed" | "failed" | "cancelled";
+  finishedAt: Date;
+};
+```
+
+Defining the method opts that runtime into completion delivery; it is a runtime consumer, not a method clients call through the Durable Object stub. The runtime durably records a pending delivery in the same transaction as the terminal status, then invokes the consumer. Returning acknowledges the event; throwing records the error and schedules another attempt with exponential backoff.
+
+Delivery is **at least once**: the same event can be delivered again if the Durable Object stops after the consumer's side effect succeeds but before the acknowledgement is recorded. **`event.id`** is stable across attempts and should be used as an idempotency key. Failed attempts continue to be retried until the consumer returns successfully, without changing the workflow's terminal status. Runtimes that do not define **`completion`** do not create delivery records or schedule delivery alarms.
 
 ### Experimental introspection
 
@@ -117,7 +139,7 @@ Each time the runtime advances, it calls `next()` on your `WorkflowDefinition`, 
 
 The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invokes `next()` until one of these happens:
 
-- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared.
+- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared. A workflow with a completion handler uses the alarm for durable terminal-outcome delivery until the handler acknowledges the event.
 - **Immediate resume**: `next()` asks to **continue immediately** (for example, so another step in the same logical “tick” can run). The loop continues without leaving the Durable Object invocation.
 - **Suspended**: `next()` asks to **suspend**—for example, a step is waiting on a **retry backoff**, a **sleep** until a future time, or a **wait** for an inbound event. The loop exits; the runtime relies on **alarms** and/or **incoming events** to call back into the run loop. A long **watchdog alarm** also exists as a safety net if progress stalls.
 
@@ -129,7 +151,7 @@ The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invok
 
 ### Alarms
 
-Alarms are the primary mechanism for waking the `WorkflowRuntime` Durable Object back up after it suspends. There are three kinds of precise alarm, each tied to a specific step, plus a long-running watchdog that acts as a safety net.
+Alarms are the primary mechanism for waking the `WorkflowRuntime` Durable Object back up after it suspends. There are three kinds of precise alarm tied to steps, a completion-delivery alarm, and a long-running watchdog that acts as a safety net.
 
 **Sleep wake-up.** When `execute()` calls `this.sleep("id", duration)`, the runtime records a `sleep` step in SQLite with a `wake_at` timestamp and immediately schedules an alarm for that exact moment. When the alarm fires, the run loop replays `execute()` from the top, reaches the sleep step, sees the wake time has passed, marks the step `elapsed`, and continues forward.
 
@@ -168,6 +190,8 @@ const payment = await this.wait<{ chargeId: string }>("capture-payment", "paymen
 });
 ```
 
+**Completion delivery.** When a workflow completes, fails, or is cancelled and its runtime defines **`completion`**, the pending delivery is stored before an immediate alarm is scheduled. Before invoking the handler, the runtime moves that alarm forward as a visibility timeout. A rejected handler is retried with exponential backoff; if the runtime stops while the handler is running, the visibility timeout makes the event eligible for redelivery.
+
 #### The watchdog alarm
 
 In addition to these precise alarms, the runtime sets a **30-minute watchdog alarm at the start of every run-loop iteration**, before delegating to the workflow definition. When an iteration ends cleanly—workflow terminal completion, suspend with a known **`wakeAt`**, or suspend waiting only on inbound events—the alarm is **cleared** or **replaced** by the next wake time when there is one. A **`wait`** with **no** `timeoutAt` has no step-specific alarm until an event arrives; the watchdog remains the backstop. The watchdog only fires if something goes wrong in the middle.
@@ -192,7 +216,7 @@ Cloudflare Workflows is a strong managed option, and for many use cases it is th
 1. Explicit ownership of workflow state and lifecycle
 2. Durable replay semantics that are explicit in userland code
 3. Separation between workflow execution and external state synchronization
-4. Extension points for streaming, WebSockets, and custom hooks
+4. Extension points for streaming, WebSockets, and custom lifecycle consumers
 5. Fewer surprises around long-lived execution and error handling
 
 ### Definition compatibility
@@ -203,33 +227,39 @@ One of the biggest concerns in long-running workflows is definition drift. A nor
 
 ### Keeping workflow execution separate from state projection
 
-In most real applications, workflows do not live in isolation. You usually have an external database that you want to keep in sync with workflow state so your application can query status, render UI, or trigger related behavior. One way to handle that is to model synchronization as a workflow step. In practice, that typically pushes you toward a top-level `try/catch`:
+In most real applications, workflows do not live in isolation. You usually have an external database that you want to keep in sync with workflow state so your application can query status, render UI, or trigger related behavior. It is tempting to model that synchronization as a final workflow step:
 
 ```ts
-export class MyWorkflow extends WorkflowEntrypoint {
-  async run(event: Event, step: WorkflowStep) {
-    try {
-      await step.do("1", async () => {
-        return 1;
-      });
+export class OrderWorkflowDefinition extends WorkflowDefinition<{ orderId: string }> {
+  async execute(): Promise<void> {
+    await this.run("fulfill-order", async () => {
+      // Perform the workflow's business operation.
+    });
 
-      await step.do("sync success", async () => {
-        //
-      });
-    } catch {
-      await step.do("sync error", async () => {
-        //
-      });
-    }
+    await this.run("project-completed-status", async () => {
+      // Update an external database.
+    });
   }
 }
 ```
 
-This looks reasonable at first, but it creates an important failure-mode problem. If the actual business steps all succeed, but the final “sync success” step fails, then the workflow as a whole is now treated as failed. At that point, workflow execution and application-state projection have become tightly coupled, even though they are not really the same concern.
+This looks reasonable at first, but it creates an important failure-mode problem. If the business operation succeeds but projection exhausts its retries, projection failure can affect the workflow's outcome even though these are not necessarily the same concern.
 
-I think a cleaner design is to keep synchronization logic out of workflow steps entirely. Projection mechanisms can consume workflow status and events independently, for example through a scheduled reconciliation job that polls workflow state and replays missed updates.
+I think a cleaner design for terminal projection is to keep synchronization out of the definition and implement **`completion`** on the runtime instead:
 
-That design keeps synchronization off the critical path of workflow completion. If synchronization fails, that failure does not retroactively redefine the workflow’s business outcome, and projection can recover independently.
+```ts
+export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
+  protected readonly definition = this.ctx.exports.OrderWorkflowDefinition;
+
+  protected async completion(event: WorkflowCompletionEvent): Promise<void> {
+    // Project the terminal workflow status; use event.id as an idempotency key because this may be retried.
+  }
+}
+```
+
+The terminal status and pending delivery are recorded together. If projection fails, the runtime retries it independently without retroactively redefining the workflow's business outcome. Because delivery is at least once, the projection should make repeated calls with the same **`event.id`** safe—for example, by storing it in a column with a unique constraint.
+
+The **`completion`** API only covers terminal outcomes. Applications that need live, non-terminal projection can poll the experimental introspection APIs or implement another runtime extension. A scheduled reconciliation job can also be useful as an independent audit and repair mechanism alongside completion delivery.
 
 That is not the only valid approach, but I think it produces a better separation of concerns: the workflow runtime determines workflow outcome, and projection mechanisms consume that outcome.
 
