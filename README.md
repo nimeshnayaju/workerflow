@@ -20,7 +20,7 @@ Pin SQLite-backed storage on the runtime class in **`wrangler.toml`** (or the eq
 # wrangler.toml (illustrative)
 name = "example-worker"
 main = "src/worker.ts"
-compatibility_date = "2026-01-28"
+compatibility_date = "2026-07-16"
 compatibility_flags = [ "nodejs_compat" ]
 
 [durable_objects]
@@ -86,7 +86,18 @@ export default {
 } satisfies ExportedHandler<Env>;
 ```
 
-Workflow input is **`this.ctx.props.input`**, populated from **`create(input)`**. TypeScript requires an input argument when your runtime's **`TInput`** excludes **`undefined`**; no-input workflows can use **`WorkflowRuntime<undefined>`**, and optionally-input workflows can include **`undefined`** in the input type. The runtime also sets **`this.ctx.props.requestId`** (a new UUID each time the run loop invokes your definition) and **`this.ctx.props.runtimeInstanceId`** (this Durable Object’s id) for logs and correlation.
+Workflow input is **`this.ctx.props.input`**, populated from **`create(input)`**. TypeScript requires an input argument when your runtime's **`TInput`** excludes **`undefined`**; no-input workflows can use **`WorkflowRuntime<undefined>`**, and optionally-input workflows can include **`undefined`** in the input type.
+
+### Logging
+
+Enable Workers Logs in the consuming Worker's Wrangler configuration:
+
+```toml
+[observability.logs]
+enabled = true
+```
+
+Workerflow writes caught permanent failures with `console.error` and plain retry notices with `console.warn`. Expected state-machine no-ops are not logged. It does not generate or attach its own request or correlation ID; Cloudflare's invocation logs and optional tracing provide request-level correlation.
 
 ### Runtime control
 

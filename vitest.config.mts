@@ -6,7 +6,7 @@ export default defineConfig({
     cloudflareTest({
       main: "test/worker.ts",
       miniflare: {
-        compatibilityDate: "2026-01-28",
+        compatibilityDate: "2026-07-16",
         compatibilityFlags: [
           "nodejs_compat",
           "enable_nodejs_tty_module",

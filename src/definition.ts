@@ -20,11 +20,9 @@ const STEP_EXECUTION_INTERRUPTED_ERROR_MESSAGE =
 
 export abstract class WorkflowDefinition<TInput extends Json | undefined = Json | undefined> extends WorkerEntrypoint<
   Cloudflare.Env,
-  { requestId: string; runtimeInstanceId: string; input: TInput }
+  { input: TInput }
 > {
   #context: WorkflowRuntimeContext | undefined;
-  #requestId: string;
-  #runtimeInstanceId: string;
   #runStepFrameContext: AsyncLocalStorage<RunStepFrame>;
 
   /**
@@ -32,11 +30,9 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
    */
   readonly #seenStepIdsSoFar: Set<RunStepId | SleepStepId | WaitStepId>;
 
-  constructor(ctx: ExecutionContext, env: Cloudflare.Env) {
+  constructor(ctx: ExecutionContext<{ input: TInput }>, env: Cloudflare.Env) {
     super(ctx, env);
     this.#seenStepIdsSoFar = new Set();
-    this.#requestId = this.ctx.props.requestId;
-    this.#runtimeInstanceId = this.ctx.props.runtimeInstanceId;
     this.#runStepFrameContext = new AsyncLocalStorage<RunStepFrame>();
   }
 
@@ -85,35 +81,41 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         error instanceof MaxAttemptsExceededError ||
         error instanceof WaitStepTimedOutError
       ) {
-        console.info(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
+        console.error(error);
         return { done: true, status: "failed" };
       } else {
-        // An exception can be thrown when calling a method on the WorkflowContext RPC target.
-        // The resulting exception will have a 'remote' property set to 'True' in this case.
-        if (error instanceof Error && "remote" in error && error.remote) {
+        // An exception can be thrown when calling a method on the WorkflowContext RPC target. Durable Object
+        // infrastructure errors use `overloaded` and `retryable` to describe how callers should respond; `remote`
+        // only identifies where an exception originated and is not itself a reason to retry.
+        if (error instanceof Error && "remote" in error && error.remote === true) {
+          if ("overloaded" in error && error.overloaded === true) {
+            console.warn(`Workflow runtime call was overloaded; deferring recovery to the watchdog: ${String(error)}`);
+            return { done: false, resume: { type: "suspended" } };
+          }
+
+          if (!("retryable" in error) || error.retryable !== true) {
+            console.error(error);
+            return { done: true, status: "failed" };
+          }
+
           /**
            * When calling Durable Objects from a Worker, errors may include .retryable and .overloaded properties
            * indicating whether the operation can be retried.
            *
            * See: https://developers.cloudflare.com/durable-objects/best-practices/error-handling/
            */
-          if ("retryable" in error && error.retryable) {
-            console.info(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
-            // If the error is retryable, we hint the workflow to suspend and retry after 5 minutes.
-            // In future, we can use a more sophisticated retry strategy.
-            return { done: false, resume: { type: "suspended", wakeAt: new Date().getTime() + 5 * 60 * 1000 } };
-          } else {
-            console.error(error, { requestId: this.#requestId, runtimeInstanceId: this.#runtimeInstanceId });
-            // All other (non-retryable) errors are considered fatal and the workflow should be aborted.
-            return { done: true, status: "failed" };
-          }
+          const retryAt = Date.now() + 5 * 60 * 1000;
+          console.warn(
+            `Workflow runtime call failed; retry scheduled for ${new Date(retryAt).toISOString()}: ${String(error)}`
+          );
+          // If the error is retryable, we hint the workflow to suspend and retry after 5 minutes.
+          // In future, we can use a more sophisticated retry strategy.
+          return { done: false, resume: { type: "suspended", wakeAt: retryAt } };
         }
 
-        // All other non-remote errors are considered fatal and the workflow should be aborted.
-        console.error(error instanceof Error ? error : String(error), {
-          requestId: this.#requestId,
-          runtimeInstanceId: this.#runtimeInstanceId
-        });
+        // All other errors are considered fatal. In particular, `remote` alone only indicates that an exception
+        // originated across an RPC boundary and does not mean that replay is safe.
+        console.error(error instanceof Error ? error : String(error));
         return { done: true, status: "failed" };
       }
     } finally {
@@ -168,7 +170,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       if (error instanceof NonRetryableStepError) throw error;
 
       if (updated.nextAttemptAt === undefined) {
-        const error = new MaxAttemptsExceededError();
+        const error = new MaxAttemptsExceededError(stepId);
         Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
         throw error;
       }
@@ -226,7 +228,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         });
 
         if (updated.nextAttemptAt === undefined) {
-          const error = new MaxAttemptsExceededError();
+          const error = new MaxAttemptsExceededError(runStepId);
           Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
           throw error;
         }
@@ -317,7 +319,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         // If the timeout has been reached (or exceeded), we mark the step as timed out and throw an 'AbortWorkflowError' to abort the workflow.
         if (Date.now() >= step.timeoutAt.getTime()) {
           await ctx.handleWaitStepTimedOut(waitStepId);
-          const error = new WaitStepTimedOutError();
+          const error = new WaitStepTimedOutError(waitStepId, event);
           Error.captureStackTrace(error, WorkflowDefinition.prototype.wait);
           throw error;
         } else {
@@ -354,8 +356,18 @@ class SuspendWorkflowError extends Error {
 }
 class AbortWorkflowError extends Error {}
 
-class MaxAttemptsExceededError extends Error {}
-class WaitStepTimedOutError extends Error {}
+class MaxAttemptsExceededError extends Error {
+  constructor(stepId: RunStepId) {
+    super(`Run step '${stepId}' exhausted its configured attempts.`);
+    this.name = "MaxAttemptsExceededError";
+  }
+}
+class WaitStepTimedOutError extends Error {
+  constructor(stepId: WaitStepId, event: string) {
+    super(`Wait step '${stepId}' timed out while waiting for event '${event}'.`);
+    this.name = "WaitStepTimedOutError";
+  }
+}
 
 export class NonRetryableStepError extends Error {
   constructor(message?: string) {

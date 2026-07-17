@@ -49,7 +49,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
         this.sql.exec("INSERT INTO migrations (version) VALUES (?)", version);
       }
     } else if (currentVersion > WorkflowRuntime.MIGRATIONS.length) {
-      console.error("Database migration version is ahead of the codebase. Please check your migrations.");
+      console.error(new Error("Database migration version is ahead of the codebase. Please check your migrations."));
     }
 
     const [metadata] = this.sql.exec<WorkflowMetadata_Row>("SELECT * FROM workflow_metadata WHERE id = 1").toArray();
@@ -65,7 +65,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
   }
 
   protected abstract readonly definition: (options: {
-    props: { requestId: string; runtimeInstanceId: string; input: TInput };
+    props: { input: TInput };
   }) => Fetcher<WorkflowDefinition<TInput>>;
 
   public getStatus(): WorkflowStatus {
@@ -198,7 +198,6 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
   async handleInboundEvent(event: string, payload?: Json): Promise<void> {
     // If the workflow is in a terminal state, we do not need to process the inbound event.
     if (this.isTerminalStatus(this.#status)) {
-      console.info(`An inbound event was received for a workflow in a terminal state: ${this.#status}`);
       return;
     }
 
@@ -408,7 +407,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     } catch (error) {
       const retryDelay = Math.min(60 * 60 * 1000, 1_000 * 2 ** Math.min(delivery.attempts - 1, 12));
       const retryAt = Date.now() + retryDelay;
-      const formattedError = error instanceof Error ? error : new Error(String(error));
+      const message = error instanceof Error ? error : new Error(String(error));
 
       await this.ctx.storage.transaction(async (transaction) => {
         this.sql.exec(
@@ -418,16 +417,15 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
            WHERE event_id = ?
              AND delivered_at IS NULL`,
           retryAt,
-          String(formattedError),
+          String(message),
           delivery.eventId
         );
         await transaction.setAlarm(retryAt);
       });
 
-      console.error(formattedError, {
-        workflowCompletionEventId: delivery.event.id,
-        attempt: delivery.attempts
-      });
+      console.warn(
+        `Completion delivery ${delivery.event.id} attempt ${delivery.attempts} failed; retry scheduled for ${new Date(retryAt).toISOString()}: ${String(message)}`
+      );
     }
   }
 
@@ -503,8 +501,8 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
     if (this.#isRunLoopActive) return;
 
-    const requestId = crypto.randomUUID();
     const context = new WorkflowRuntimeContext(this.ctx.storage);
+    let definitionRetryAttempt = 0;
 
     this.#isRunLoopActive = true;
 
@@ -536,8 +534,6 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
             const executor = this.definition({
               props: {
-                runtimeInstanceId: this.ctx.id.toString(),
-                requestId,
                 input: this.#definitionInput as TInput
               }
             });
@@ -546,7 +542,56 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
             // especially when a step has been durably marked as started but the engine has not durably recorded how to proceed next.
             await this.ctx.storage.setAlarm(Date.now() + 30_000 * 60); // 30 minutes
 
-            const result = await executor.next(context);
+            let result: Awaited<ReturnType<WorkflowDefinition<TInput>["next"]>>;
+            try {
+              result = await executor.next(context);
+            } catch (error) {
+              // Do not actively retry an overloaded Durable Object. The watchdog set before the definition call remains
+              // in place and provides a much later recovery attempt without amplifying current platform pressure.
+              // `overloaded` takes precedence if the runtime supplies both `overloaded` and `retryable`.
+              if (error instanceof Error && "overloaded" in error && error.overloaded === true) {
+                console.warn(
+                  `Workflow definition call was overloaded; deferring recovery to the watchdog: ${String(error)}`
+                );
+                break;
+              }
+
+              // Retry explicitly retryable Durable Object failures a few times in the current invocation. Each loop
+              // creates a new executor because a stub can remain broken after an exception. If the invocation disappears
+              // during the wait, or the short retry budget is exhausted, the existing watchdog remains the durable backup.
+              if (error instanceof Error && "retryable" in error && error.retryable === true) {
+                if (this.getStatus() !== "running") break;
+
+                if (definitionRetryAttempt >= 3) {
+                  console.warn(
+                    `Workflow definition retries exhausted; deferring recovery to the watchdog: ${String(error)}`
+                  );
+                  break;
+                }
+
+                const retryDelay =
+                  Math.min(20_000, 5_000 * 2 ** definitionRetryAttempt) + Math.floor(Math.random() * 1_000);
+                definitionRetryAttempt++;
+                console.warn(
+                  `Workflow definition call failed; retrying in ${retryDelay}ms (attempt ${definitionRetryAttempt} of 3): ${String(error)}`
+                );
+
+                try {
+                  await scheduler.wait(retryDelay);
+                } catch (waitError) {
+                  console.warn(
+                    `Workflow definition retry wait was interrupted; deferring to the watchdog: ${String(waitError)}`
+                  );
+                  break;
+                }
+
+                if (this.getStatus() !== "running") break;
+                continue;
+              }
+
+              throw error;
+            }
+            definitionRetryAttempt = 0;
 
             // If the workflow was cancelled while waiting for the executor to return a response, we exit the loop immediately.
             if (this.#status === "cancelled") {
@@ -596,15 +641,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
             break;
           } catch (error) {
-            // An exception can be thrown when calling 'next()' on the executor worker.
-            // The resulting exception will have a 'remote' property set to 'True' in this case.
-            // In this case, the error is considered to be transient and the workflow should continue.
-            if (error instanceof Error && "remote" in error && error.remote) {
-              console.info(error, { requestId });
-              continue;
-            }
-
-            console.error(error instanceof Error ? error : new Error(String(error)), { requestId });
+            console.error(error instanceof Error ? error : new Error(String(error)));
 
             // If the workflow is in a terminal state, we do not need to process the error.
             if (this.isTerminalStatus(this.#status)) break;
@@ -635,6 +672,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
             if (this.completion !== undefined) {
               await this.deliverCompletion();
             }
+            break;
           }
         }
       } finally {

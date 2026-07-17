@@ -597,6 +597,418 @@ describe("WorkflowRuntime", () => {
     }
   });
 
+  describe("definition RPC error handling", () => {
+    it("uses scheduler.wait to retry an explicitly retryable definition call across loopback RPC", async () => {
+      const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue();
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const nextSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "next")
+        .mockRejectedValueOnce(
+          Object.assign(new Error("definition unavailable"), {
+            retryable: true
+          })
+        )
+        .mockResolvedValueOnce({ done: true, status: "completed" });
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+
+          expect(nextSpy).toHaveBeenCalledTimes(2);
+          expect(waitSpy).toHaveBeenCalledOnce();
+          expect(waitSpy).toHaveBeenCalledWith(5_500);
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        waitSpy.mockRestore();
+        randomSpy.mockRestore();
+        warnSpy.mockRestore();
+        nextSpy.mockRestore();
+      }
+    });
+
+    it("stops short retries after three attempts and retains the watchdog", async () => {
+      const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue();
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.5);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          const definition = vi.fn(() => ({
+            next: vi.fn(async () => {
+              throw Object.assign(new Error("still unavailable"), { retryable: true });
+            })
+          }));
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+
+          await instance.create();
+          await expect
+            .poll(() =>
+              warnSpy.mock.calls.some(([message]) => String(message).includes("definition retries exhausted"))
+            )
+            .toBe(true);
+
+          expect(instance.getStatus()).toBe("running");
+          expect(definition).toHaveBeenCalledTimes(4);
+          expect(waitSpy.mock.calls).toEqual([[5_500], [10_500], [20_500]]);
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          expect(watchdogAt as number).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+        });
+      } finally {
+        waitSpy.mockRestore();
+        randomSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("gives overloaded precedence over retryable and defers recovery to the watchdog", async () => {
+      const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue();
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const nextSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "next")
+        .mockRejectedValueOnce(
+          Object.assign(new Error("definition overloaded"), {
+            retryable: true,
+            overloaded: true
+          })
+        )
+        .mockResolvedValueOnce({ done: true, status: "completed" });
+      const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+
+      try {
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => warnSpy.mock.calls.some(([message]) => String(message).includes("was overloaded")))
+            .toBe(true);
+
+          expect(instance.getStatus()).toBe("running");
+          expect(nextSpy).toHaveBeenCalledOnce();
+          expect(waitSpy).not.toHaveBeenCalled();
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          expect(watchdogAt as number).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+        });
+
+        await evictDurableObject(stub);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+        });
+      } finally {
+        waitSpy.mockRestore();
+        warnSpy.mockRestore();
+        nextSpy.mockRestore();
+      }
+    });
+
+    it("does not treat remote alone as a reason to retry", async () => {
+      const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue();
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+      const nextSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "next")
+        .mockRejectedValueOnce(new Error("remote user error"));
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect.poll(() => instance.getStatus()).toBe("failed");
+
+          expect(nextSpy).toHaveBeenCalledOnce();
+          expect(waitSpy).not.toHaveBeenCalled();
+          expect(errorSpy.mock.calls[0]?.[0]).toMatchObject({ remote: true });
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        waitSpy.mockRestore();
+        errorSpy.mockRestore();
+        nextSpy.mockRestore();
+      }
+    });
+
+    it("does not retry after the workflow is paused during scheduler.wait", async () => {
+      const retryWait = Promise.withResolvers<void>();
+      const waitSpy = vi.spyOn(scheduler, "wait").mockImplementation(() => retryWait.promise);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          const definition = vi.fn(() => ({
+            next: vi.fn(async () => {
+              throw Object.assign(new Error("definition unavailable"), { retryable: true });
+            })
+          }));
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+
+          await instance.create();
+          await expect.poll(() => waitSpy.mock.calls.length).toBe(1);
+          await instance.pause();
+          retryWait.resolve();
+          await retryWait.promise;
+          await Promise.resolve();
+
+          expect(instance.getStatus()).toBe("paused");
+          expect(definition).toHaveBeenCalledOnce();
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        retryWait.resolve();
+        waitSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("does not retry after the workflow is cancelled during scheduler.wait", async () => {
+      const retryWait = Promise.withResolvers<void>();
+      const waitSpy = vi.spyOn(scheduler, "wait").mockImplementation(() => retryWait.promise);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      try {
+        const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance, state) => {
+          const definition = vi.fn(() => ({
+            next: vi.fn(async () => {
+              throw Object.assign(new Error("definition unavailable"), { retryable: true });
+            })
+          }));
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+
+          await instance.create();
+          await expect.poll(() => waitSpy.mock.calls.length).toBe(1);
+          await instance.cancel("cancel during retry wait");
+          retryWait.resolve();
+          await retryWait.promise;
+          await Promise.resolve();
+
+          expect(instance.getStatus()).toBe("cancelled");
+          expect(definition).toHaveBeenCalledOnce();
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        retryWait.resolve();
+        waitSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("defers to the watchdog when scheduler.wait is interrupted", async () => {
+      const waitSpy = vi.spyOn(scheduler, "wait").mockRejectedValueOnce(new DOMException("interrupted", "AbortError"));
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const definition = vi.fn(() => ({
+        next: vi.fn(async () => {
+          throw Object.assign(new Error("definition unavailable"), { retryable: true });
+        })
+      }));
+      const objectName = crypto.randomUUID();
+      let stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+
+      try {
+        await runInDurableObject(stub, async (instance, state) => {
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+          await instance.create();
+          await expect
+            .poll(() => warnSpy.mock.calls.some(([message]) => String(message).includes("retry wait was interrupted")))
+            .toBe(true);
+
+          expect(instance.getStatus()).toBe("running");
+          expect(definition).toHaveBeenCalledOnce();
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          expect(watchdogAt as number).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+        });
+
+        await evictDurableObject(stub);
+        stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+        });
+      } finally {
+        waitSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("recovers from forced teardown during scheduler.wait using the persisted watchdog", async () => {
+      const retryWaitStarted = Promise.withResolvers<void>();
+      const schedulerWait = scheduler.wait.bind(scheduler);
+      const waitSpy = vi.spyOn(scheduler, "wait").mockImplementation((delay, options) => {
+        retryWaitStarted.resolve();
+        return schedulerWait(delay, options);
+      });
+      const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const definition = vi.fn(() => ({
+        next: vi.fn(async () => {
+          throw Object.assign(new Error("definition unavailable"), { retryable: true });
+        })
+      }));
+      const objectName = crypto.randomUUID();
+      let stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+
+      try {
+        await runInDurableObject(stub, async (instance, state) => {
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+          await instance.create();
+          await retryWaitStarted.promise;
+          expect(instance.getStatus()).toBe("running");
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          expect(watchdogAt as number).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+        });
+
+        await abortAllDurableObjects();
+        stub = env.TEST_WORKFLOW_RUNTIME.getByName(objectName);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+        });
+
+        expect(definition).toHaveBeenCalledOnce();
+      } finally {
+        waitSpy.mockRestore();
+        randomSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("preserves completion delivery when cancelled during scheduler.wait", async () => {
+      const retryWait = Promise.withResolvers<void>();
+      const waitSpy = vi.spyOn(scheduler, "wait").mockImplementation(() => retryWait.promise);
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const definition = vi.fn(() => ({
+        next: vi.fn(async () => {
+          throw Object.assign(new Error("definition unavailable"), { retryable: true });
+        })
+      }));
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
+      const completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+        .mockImplementation(async (event) => {
+          receivedEvents.push(event);
+        });
+
+      try {
+        const stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+        await runInDurableObject(stub, async (instance) => {
+          Object.defineProperty(instance, "definition", { configurable: true, value: definition });
+          await instance.create();
+          await expect.poll(() => waitSpy.mock.calls.length).toBe(1);
+        });
+        await stub.cancel("cancel during retry wait");
+        retryWait.resolve();
+        await retryWait.promise;
+        await Promise.resolve();
+
+        await runInDurableObject(stub, async (instance, state) => {
+          expect(instance.getStatus()).toBe("cancelled");
+          expect(definition).toHaveBeenCalledOnce();
+          expect(completionSpy).toHaveBeenCalledOnce();
+          expect(receivedEvents).toHaveLength(1);
+          expect(receivedEvents[0]).toMatchObject({ status: "cancelled" });
+          const delivery = state.storage.sql
+            .exec<WorkflowEventDeliveryRow>("SELECT * FROM workflow_event_deliveries")
+            .one();
+          expect(delivery.delivered_at).toEqual(expect.any(Number));
+          expect(await state.storage.getAlarm()).toBeNull();
+        });
+      } finally {
+        retryWait.resolve();
+        waitSpy.mockRestore();
+        warnSpy.mockRestore();
+        completionSpy.mockRestore();
+      }
+    });
+
+    it("schedules the existing five-minute alarm for a retryable workflow-context call", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const contextSpy = vi.spyOn(WorkflowRuntimeContext.prototype, "getOrCreateRunStep").mockImplementationOnce(() => {
+        throw Object.assign(new Error("workflow runtime unavailable"), {
+          retryable: true
+        });
+      });
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run("context-retryable", async () => "recovered");
+        });
+      const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+
+      try {
+        const beforeCreate = Date.now();
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => warnSpy.mock.calls.some(([message]) => String(message).includes("retry scheduled")))
+            .toBe(true);
+
+          expect(instance.getStatus()).toBe("running");
+          const retryAt = await state.storage.getAlarm();
+          expect(retryAt).not.toBeNull();
+          expect(retryAt as number).toBeGreaterThanOrEqual(beforeCreate + 5 * 60_000);
+          expect(retryAt as number).toBeLessThanOrEqual(Date.now() + 5 * 60_000);
+        });
+
+        await evictDurableObject(stub);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+        });
+      } finally {
+        contextSpy.mockRestore();
+        executeSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+
+    it("defers an overloaded workflow-context call to the watchdog even when it is also retryable", async () => {
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const contextSpy = vi.spyOn(WorkflowRuntimeContext.prototype, "getOrCreateRunStep").mockImplementationOnce(() => {
+        throw Object.assign(new Error("workflow runtime overloaded"), {
+          retryable: true,
+          overloaded: true
+        });
+      });
+      const executeSpy = vi
+        .spyOn(TestWorkflowDefinition.prototype, "execute")
+        .mockImplementation(async function (this: TestWorkflowDefinition) {
+          await this.run("context-overloaded", async () => "recovered");
+        });
+      const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
+
+      try {
+        await runInDurableObject(stub, async (instance, state) => {
+          await instance.create();
+          await expect
+            .poll(() => warnSpy.mock.calls.some(([message]) => String(message).includes("runtime call was overloaded")))
+            .toBe(true);
+
+          expect(instance.getStatus()).toBe("running");
+          const watchdogAt = await state.storage.getAlarm();
+          expect(watchdogAt).not.toBeNull();
+          expect(watchdogAt as number).toBeGreaterThanOrEqual(Date.now() + 29 * 60_000);
+        });
+
+        await evictDurableObject(stub);
+        expect(await runDurableObjectAlarm(stub)).toBe(true);
+        await runInDurableObject(stub, async (instance) => {
+          await expect.poll(() => instance.getStatus()).toBe("completed");
+        });
+      } finally {
+        contextSpy.mockRestore();
+        executeSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    });
+  });
+
   it("retry workflow completes after a transient failure on the first attempt", async () => {
     let attemptCount = 0;
     const nextSpy = vi.spyOn(TestWorkflowDefinition.prototype, "next");
