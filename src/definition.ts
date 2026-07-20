@@ -10,9 +10,8 @@ declare global {
 }
 
 /**
- * `numOfSuccessfulRunCallbacks` counts successful sibling `run()` experimental_completions in this frame during the
- * current `next()` (see `WorkflowDefinition.run`). `parentStepId` is the innermost enclosing run step for nested
- * steps.
+ * `numOfSuccessfulRunCallbacks` counts successful sibling `run()` completions in this frame during the current `next()`
+ * (see `WorkflowDefinition.run`). `parentStepId` is the innermost enclosing run step for nested steps.
  */
 type RunStepFrame = { numOfSuccessfulRunCallbacks: number; parentStepId: RunStepId | null };
 

@@ -28,7 +28,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
    * acknowledges the event; throwing causes it to be retried. Delivery is at least once, so implementations must use
    * `event.id` to make side effects idempotent.
    */
-  protected experimental_completion?(event: WorkflowCompletionEvent): Promise<void>;
+  protected completion_experimental?(event: WorkflowCompletionEvent): Promise<void>;
 
   constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
     super(ctx, env);
@@ -294,7 +294,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
     await this.ctx.storage.transaction(async (transaction) => {
       const event = this.#setStatus({ type: "cancelled", reason });
-      if (event?.type === "cancelled" && this.experimental_completion !== undefined) {
+      if (event?.type === "cancelled" && this.completion_experimental !== undefined) {
         const deliverAt = Date.now();
         this.sql.exec(
           `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
@@ -308,7 +308,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     });
     this.#status = "cancelled";
     this.onStatusChange?.("cancelled");
-    if (this.experimental_completion !== undefined) {
+    if (this.completion_experimental !== undefined) {
       await this.deliverCompletion();
     }
   }
@@ -416,13 +416,13 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
     if (delivery === undefined) return;
 
     try {
-      if (this.experimental_completion === undefined) {
+      if (this.completion_experimental === undefined) {
         throw new Error(
-          "A workflow experimental_completion delivery is pending, but the runtime no longer defines a experimental_completion handler."
+          "A workflow completion delivery is pending, but the runtime no longer defines a completion_experimental handler."
         );
       }
 
-      await this.experimental_completion(delivery.event);
+      await this.completion_experimental(delivery.event);
 
       await this.ctx.storage.transaction(async (transaction) => {
         this.sql.exec(
@@ -653,7 +653,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
             if (result.done) {
               await this.ctx.storage.transaction(async (transaction) => {
                 const event = this.#setStatus({ type: result.status });
-                if (event !== undefined && this.experimental_completion !== undefined) {
+                if (event !== undefined && this.completion_experimental !== undefined) {
                   const deliverAt = Date.now();
                   this.sql.exec(
                     `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
@@ -668,7 +668,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
 
               this.#status = result.status;
               this.onStatusChange?.(result.status);
-              if (this.experimental_completion !== undefined) {
+              if (this.completion_experimental !== undefined) {
                 await this.deliverCompletion();
               }
               break;
@@ -796,7 +796,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
             // All other errors are considered to be fatal and the workflow should be aborted.
             await this.ctx.storage.transaction(async (transaction) => {
               const event = this.#setStatus({ type: "failed" });
-              if (event?.type === "failed" && this.experimental_completion !== undefined) {
+              if (event?.type === "failed" && this.completion_experimental !== undefined) {
                 const deliverAt = Date.now();
                 this.sql.exec(
                   `INSERT INTO workflow_event_deliveries (event_id, next_attempt_at) VALUES (?, ?)`,
@@ -810,7 +810,7 @@ export abstract class WorkflowRuntime<TInput extends Json | undefined = Json | u
             });
             this.#status = "failed";
             this.onStatusChange?.("failed");
-            if (this.experimental_completion !== undefined) {
+            if (this.completion_experimental !== undefined) {
               await this.deliverCompletion();
             }
             break;
@@ -1579,7 +1579,7 @@ function formatSatisfiedWaitStep<T extends Json | undefined>(
  * A durably delivered notification that a workflow reached a terminal status.
  *
  * The same event can be delivered more than once. `id` is stable across attempts and should be used as the idempotency
- * key for side effects performed by the experimental_completion handler.
+ * key for side effects performed by the completion handler.
  */
 export type WorkflowCompletionEvent = {
   id: string;
