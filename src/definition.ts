@@ -1,6 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import type { Json } from "./json";
-import type { RunStepId, SleepStepId, WaitStepId, WorkflowRuntimeContext } from "./runtime";
+import type { RunStepAttemptId, RunStepId, SleepStepId, WaitStepId, WorkflowRuntimeContext } from "./runtime";
 import { AsyncLocalStorage } from "node:async_hooks";
 
 declare global {
@@ -50,17 +50,16 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
    *
    *   - { done: true; status: "completed" | "failed" }: the workflow has completed or aborted.
    *   - { done: false; resume: { type: "immediate" } }: the workflow should resume immediately.
-   *   - { done: false; resume: { type: "suspended", wakeAt?: number } }: the workflow should suspend itself and wait for
-   *     the next alarm or inbound event to resume. The `wakeAt` property is the timestamp at which the workflow should
-   *     wake up. If the `wakeAt` property is not present, the workflow should wait for the next inbound event to
-   *     resume.
+   *   - { done: false; resume: { type: "suspended" } }: durable state already describes how the workflow should resume.
+   *   - { done: false; resume: { type: "retry", retryAt: number } }: a workflow-context transport failure should be
+   *     retried at the provided timestamp.
    * @internal
    */
   async next(context: WorkflowRuntimeContext): Promise<
     | { done: true; status: "completed" | "failed" }
     | {
         done: false;
-        resume: { type: "immediate" } | { type: "suspended"; wakeAt?: number };
+        resume: { type: "immediate" } | { type: "suspended" } | { type: "retry"; retryAt: number };
       }
   > {
     this.#context = context;
@@ -73,7 +72,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
       if (error instanceof ResumeImmediatelyError) {
         return { done: false, resume: { type: "immediate" } };
       } else if (error instanceof SuspendWorkflowError) {
-        return { done: false, resume: { type: "suspended", wakeAt: error.wakeAt } };
+        return { done: false, resume: { type: "suspended" } };
       } else if (error instanceof AbortWorkflowError) {
         return { done: true, status: "failed" };
       } else if (
@@ -108,9 +107,9 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
           console.warn(
             `Workflow runtime call failed; retry scheduled for ${new Date(retryAt).toISOString()}: ${String(error)}`
           );
-          // If the error is retryable, we hint the workflow to suspend and retry after 5 minutes.
+          // This transport failure may not have reached durable state, so request a retry after 5 minutes.
           // In future, we can use a more sophisticated retry strategy.
-          return { done: false, resume: { type: "suspended", wakeAt: retryAt } };
+          return { done: false, resume: { type: "retry", retryAt } };
         }
 
         // All other errors are considered fatal. In particular, `remote` alone only indicates that an exception
@@ -143,6 +142,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
   async #processRunStepAttempt<T extends Json | undefined | void>(
     stepId: RunStepId,
+    attemptId: RunStepAttemptId,
     ctx: WorkflowRuntimeContext,
     callback: () => Promise<T>
   ): Promise<T> {
@@ -161,13 +161,26 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         throw error;
       }
 
-      const updated = await ctx.handleRunAttemptFailed(stepId, {
+      // Transport errors from a nested context operation belong to next()'s recovery policy. In particular, the
+      // operation may already have committed child state that lets the enclosing attempt resume safely on replay.
+      if (error instanceof Error && "remote" in error && error.remote === true) {
+        throw error;
+      }
+
+      // A terminal nested-step outcome cannot be repaired by replaying the enclosing callback. Record the enclosing
+      // attempt as non-retryable and preserve the original control flow.
+      const isTerminalNestedStepError =
+        error instanceof WaitStepTimedOutError ||
+        error instanceof AbortWorkflowError ||
+        error instanceof MaxAttemptsExceededError;
+
+      const updated = await ctx.handleRunAttemptFailed(stepId, attemptId, {
         errorMessage: String(error),
         errorName: error instanceof Error ? error.name : undefined,
-        isNonRetryableStepError: error instanceof NonRetryableStepError
+        isNonRetryableStepError: error instanceof NonRetryableStepError || isTerminalNestedStepError
       });
 
-      if (error instanceof NonRetryableStepError) throw error;
+      if (error instanceof NonRetryableStepError || isTerminalNestedStepError) throw error;
 
       if (updated.nextAttemptAt === undefined) {
         const error = new MaxAttemptsExceededError(stepId);
@@ -175,15 +188,36 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
         throw error;
       }
 
-      throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
+      throw new SuspendWorkflowError();
     }
 
-    // SQL NULL (resultJson === null) encodes `undefined`; otherwise raw JSON.stringify for the value.
-    const resultJson = _result === undefined ? null : JSON.stringify(_result);
-    await ctx.handleRunAttemptSucceeded(stepId, resultJson);
+    let resultJson: string | null;
+    try {
+      resultJson = serializeRunStepResult(_result);
+    } catch (cause) {
+      // Serialization is part of producing the durable callback outcome. Treat values outside the supported JSON
+      // domain as a terminal step failure rather than leaving the attempt in `started` or persisting a value that will
+      // replay differently. Keep handleRunAttemptSucceeded() outside this catch: a transport error from that call may
+      // mean the success transaction committed and must be recovered by replay instead of rewritten as a failure.
+      const error = new NonRetryableStepError(
+        `Run step '${stepId}' returned a value that cannot be durably serialized as JSON: ${String(cause)}`
+      );
+      Error.captureStackTrace(error, WorkflowDefinition.prototype.run);
+      await ctx.handleRunAttemptFailed(stepId, attemptId, {
+        errorMessage: String(error),
+        errorName: error.name,
+        isNonRetryableStepError: true
+      });
+      throw error;
+    }
+
+    await ctx.handleRunAttemptSucceeded(stepId, attemptId, resultJson);
 
     this.#getRunStepFrame().numOfSuccessfulRunCallbacks += 1;
-    return _result as T;
+    // Return the same canonical value that a later replay reconstructs from durable state. In particular, JSON turns
+    // signed zero into zero and may apply user-defined toJSON methods; callers must not observe a different first-run
+    // value from the one replay will produce.
+    return (resultJson === null ? undefined : JSON.parse(resultJson)) as T;
   }
 
   protected async run<T extends Json | undefined | void>(
@@ -216,13 +250,13 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
     const lastAttempt = step.attempts[step.attempts.length - 1];
     if (lastAttempt === undefined) {
-      await ctx.handleRunAttemptStarted(runStepId);
+      const started = await ctx.handleRunAttemptStarted(runStepId);
 
-      return await this.#processRunStepAttempt(runStepId, ctx, callback);
+      return await this.#processRunStepAttempt(runStepId, started.id, ctx, callback);
     } else if (lastAttempt.state === "started") {
       const hasInProgressChildSteps = await ctx.hasInProgressChildSteps(runStepId);
       if (!hasInProgressChildSteps) {
-        const updated = await ctx.handleRunAttemptFailed(runStepId, {
+        const updated = await ctx.handleRunAttemptFailed(runStepId, lastAttempt.id, {
           errorMessage: STEP_EXECUTION_INTERRUPTED_ERROR_MESSAGE,
           errorName: undefined
         });
@@ -233,17 +267,17 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
           throw error;
         }
 
-        throw new SuspendWorkflowError(updated.nextAttemptAt.getTime());
+        throw new SuspendWorkflowError();
       } else {
-        return await this.#processRunStepAttempt(runStepId, ctx, callback);
+        return await this.#processRunStepAttempt(runStepId, lastAttempt.id, ctx, callback);
       }
     } else if (lastAttempt.state === "failed") {
       if (lastAttempt.nextAttemptAt) {
         if (lastAttempt.nextAttemptAt.getTime() <= Date.now()) {
-          await ctx.handleRunAttemptStarted(runStepId);
-          return await this.#processRunStepAttempt(runStepId, ctx, callback);
+          const started = await ctx.handleRunAttemptStarted(runStepId);
+          return await this.#processRunStepAttempt(runStepId, started.id, ctx, callback);
         } else {
-          throw new SuspendWorkflowError(lastAttempt.nextAttemptAt.getTime());
+          throw new SuspendWorkflowError();
         }
       } else {
         throw new AbortWorkflowError();
@@ -281,7 +315,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
     } else if (step.state === "waiting") {
       // If the sleep step is not yet due to wake up, we suspend the workflow.
       if (Date.now() < step.wakeAt.getTime()) {
-        throw new SuspendWorkflowError(step.wakeAt.getTime());
+        throw new SuspendWorkflowError();
       }
       // If the sleep step is due to wake up, we mark the step as elapsed and throw a 'ResumeImmediatelyError' to hint the driver to resume the workflow immediately.
       else {
@@ -310,7 +344,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
     const step = await ctx.getOrCreateWaitStep<T>(waitStepId, {
       eventName: event,
-      timeoutAt: config?.timeoutAt ? new Date(config.timeoutAt) : undefined,
+      timeoutAt: config?.timeoutAt !== undefined ? new Date(config.timeoutAt) : undefined,
       parentStepId: this.#getRunStepFrame().parentStepId
     });
 
@@ -324,7 +358,7 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
           throw error;
         } else {
           // If the timeout has not been reached, we suspend the workflow and wait for the next alarm to resume.
-          throw new SuspendWorkflowError(step.timeoutAt.getTime());
+          throw new SuspendWorkflowError();
         }
       } else {
         // If the wait step does not have a timeout, we suspend the workflow and wait for the next inbound event to resume.
@@ -344,14 +378,9 @@ export abstract class WorkflowDefinition<TInput extends Json | undefined = Json 
 
 class ResumeImmediatelyError extends Error {}
 class SuspendWorkflowError extends Error {
-  readonly #wakeAt?: number;
-  constructor(wakeAt?: number) {
+  constructor() {
     super();
-    this.#wakeAt = wakeAt;
     this.name = "SuspendWorkflowError";
-  }
-  get wakeAt() {
-    return this.#wakeAt;
   }
 }
 class AbortWorkflowError extends Error {}
@@ -374,4 +403,27 @@ export class NonRetryableStepError extends Error {
     super(message);
     this.name = "NonRetryableStepError";
   }
+}
+
+/**
+ * Serializes a run callback result for durable storage.
+ *
+ * SQL NULL is reserved for a root `undefined` result. Non-finite numbers are rejected explicitly because JSON.stringify
+ * silently converts them to JSON null, which would otherwise make the first execution and replay observe different
+ * values. JSON.stringify itself rejects cyclic structures and BigInt values.
+ */
+function serializeRunStepResult(value: unknown): string | null {
+  if (value === undefined) return null;
+
+  const result = JSON.stringify(value, (_key, nestedValue: unknown) => {
+    if (typeof nestedValue === "number" && !Number.isFinite(nestedValue)) {
+      throw new TypeError("Run step results cannot contain NaN or infinite numbers.");
+    }
+    return nestedValue;
+  });
+
+  if (result === undefined) {
+    throw new TypeError("Run step result is not JSON-serializable.");
+  }
+  return result;
 }

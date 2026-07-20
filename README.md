@@ -12,7 +12,7 @@ npm install workerflow
 
 ## Usage
 
-Import **`WorkflowRuntime`** and **`WorkflowDefinition`**, then define two classes: a **Durable Object** subclass that resolves definition versions, and a **`WorkerEntrypoint`** subclass that implements **`execute()`** using **`run`**, **`sleep`**, and **`wait`**.
+Import **`WorkflowRuntime`** and **`WorkflowDefinition`**, then define two classes: a **Durable Object** subclass that points to the definition entrypoint, and a **`WorkerEntrypoint`** subclass that implements **`execute()`** using **`run`**, **`sleep`**, and **`wait`**.
 
 Pin SQLite-backed storage on the runtime class in **`wrangler.toml`** (or the equivalent config) so the DO can use **`SqlStorage`**. Set the **`nodejs_compat`** compatibility flag so **`node:async_hooks`** (**`AsyncLocalStorage`**, used by **`WorkflowDefinition`**) resolves in the Workers runtime.
 
@@ -142,6 +142,9 @@ The library separates concerns into two main layers:
 
 Each time the runtime advances, it calls `next()` on your `WorkflowDefinition`, which **runs `execute()` from the beginning again**. Steps that have already completed durably (`run`, elapsed `sleep`, resolved `wait`, and so on) **replay from stored state**: their callbacks are not re-invoked, and recorded results are returned as-is. New side effects happen only when the engine reaches a step that is not yet complete and the durable state allows that transition.
 
+> [!IMPORTANT]
+> **Do not swallow errors thrown by `run()`, `sleep()`, or `wait()`.** These helpers use internal errors to suspend or immediately resume workflow execution. If `execute()` or a surrounding `run()` callback catches one and returns normally, the runtime may interpret that as successful workflow completion even though a durable step is still waiting. Catch business errors inside the `run()` callback that owns the operation, and either handle them completely or rethrow them; do not place a broad `try`/`catch` around step-helper calls unless the caught error is rethrown.
+
 **Step ids must be unique** within one top-level **`execute()`** run (the same **`next()`** invocation): reuse the same id across **`run`**, **`sleep`**, or **`wait`** and the workflow fails fast.
 
 **Sibling `run` calls.** At a given nesting level, after one **`run`** finishes successfully in the same **`next()`**, the next sibling **`run`** forces the runtime to **run the loop again immediately** (you still replay from the top; completed steps stay cached). For linear workflows this is invisible; if you place several **`run`** calls back-to-back at the same depth, expect an extra loop hop per step after the first. Nested **`run`** callbacks get a fresh frame, so children do not consume the parent’s sibling budget.
@@ -152,33 +155,32 @@ The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invok
 
 - **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared. A workflow with a completion handler uses the alarm for durable terminal-outcome delivery until the handler acknowledges the event.
 - **Immediate resume**: `next()` asks to **continue immediately** (for example, so another step in the same logical “tick” can run). The loop continues without leaving the Durable Object invocation.
-- **Suspended**: `next()` asks to **suspend**—for example, a step is waiting on a **retry backoff**, a **sleep** until a future time, or a **wait** for an inbound event. The loop exits; the runtime relies on **alarms** and/or **incoming events** to call back into the run loop. A long **watchdog alarm** also exists as a safety net if progress stalls.
+- **Suspended**: `next()` asks to **suspend**—for example, a step is waiting on a **retry backoff**, a **sleep** until a future time, or a **wait** for an inbound event. This is only a control-flow result: the context operation has already persisted any required recovery alarm alongside the step state. The loop exits and relies on that alarm and/or an incoming event to call back into the run loop. A long **watchdog alarm** also exists as a safety net if progress stalls.
 
 ### Step kinds
 
-- **`run`**: A named, durable unit of work. Callbacks return JSON-serializable values or `undefined`. Outcomes are persisted; failures can be **retried** with backoff up to **`maxAttempts`** (default **3** attempts per step unless you pass `{ maxAttempts: n }`).
+- **`run`**: A named, durable unit of work. Callbacks return JSON-serializable values or `undefined`; the first execution returns the canonical persisted JSON value so it is identical on replay. Non-finite numbers, cyclic structures, and other non-serializable results are recorded as non-retryable step failures. Outcomes are persisted; failures can be **retried** with backoff up to **`maxAttempts`** (default **3** attempts per step unless you pass `{ maxAttempts: n }`).
 - **`sleep`**: Pauses until a **scheduled wake time** stored in SQLite; the Durable Object is woken by an **alarm** when that time is reached.
 - **`wait`**: Pauses until a matching **inbound event** (by name) or an optional **timeout**. Resolution is recorded in durable state so replay does not double-apply the branch that handled the event.
 
 ### Alarms
 
-Alarms are the primary mechanism for waking the `WorkflowRuntime` Durable Object back up after it suspends. There are three kinds of precise alarm tied to steps, a completion-delivery alarm, and a long-running watchdog that acts as a safety net.
+Alarms are the primary mechanism for waking the `WorkflowRuntime` Durable Object back up after it suspends. While `next()` is in flight, step transitions record their recovery deadlines and atomically ensure that the current alarm is no later than the earliest known deadline. After `next()` acknowledges a stable suspension, the runtime hands that safety alarm off to the exact earliest durable deadline when no unrelated started attempt still needs the watchdog. Completion delivery has its own alarm schedule.
 
-**Sleep wake-up.** When `execute()` calls `this.sleep("id", duration)`, the runtime records a `sleep` step in SQLite with a `wake_at` timestamp and immediately schedules an alarm for that exact moment. When the alarm fires, the run loop replays `execute()` from the top, reaches the sleep step, sees the wake time has passed, marks the step `elapsed`, and continues forward.
+**Sleep wake-up.** When `execute()` calls `this.sleep("id", duration)`, the runtime records a `sleep` step in SQLite with a wake timestamp and atomically ensures that an alarm is scheduled no later than that moment. Once suspension is acknowledged and no unrelated started attempt still needs the watchdog, the alarm is moved to the exact wake timestamp. When the sleep becomes due, the run loop replays `execute()` from the top, reaches the sleep step, marks it `elapsed`, and continues forward.
 
 ```ts
 async execute(): Promise<void> {
   await this.run("charge", async () => { /* ... */ });
 
-  // Schedules a Durable Object alarm 24 hours from now.
-  // The DO hibernates; no CPU is consumed until the alarm fires.
+  // Schedules the stable suspended workflow to wake 24 hours from now.
   await this.sleep("cooling-off-period", 24 * 60 * 60 * 1_000);
 
   await this.run("ship", async () => { /* ... */ });
 }
 ```
 
-**Retry backoff.** When a `run` step fails but has attempts remaining, the runtime computes an exponential backoff delay (`250 ms → 500 ms → 1 s → 2 s → 4 s → 8 s → 10 s`), records `next_attempt_at` in SQLite, and schedules an alarm for that time. The DO goes idle; the run loop resumes only when the alarm fires.
+**Retry backoff.** When a `run` step fails but has attempts remaining, the runtime computes an exponential backoff delay (`250 ms → 500 ms → 1 s → 2 s → 4 s → 8 s → 10 s`), records `next_attempt_at` in SQLite, and atomically ensures that the current alarm is no later than that time. The DO goes idle; the run loop resumes when the retry becomes due.
 
 ```ts
 await this.run(
@@ -192,7 +194,7 @@ await this.run(
 );
 ```
 
-**Wait timeout.** When `this.wait` is called with a `timeoutAt`, the runtime schedules an alarm for that deadline. If no matching inbound event has arrived by then, the alarm fires, the step transitions to `timed_out`, and execution continues past the wait.
+**Wait timeout.** When `this.wait` is called with a `timeoutAt`, the runtime records the waiting step and atomically ensures that the current alarm is no later than that deadline. If no matching inbound event has arrived by then, the step transitions to `timed_out` and the workflow fails.
 
 ```ts
 // Suspend until "payment.received" is delivered or 24 hours elapse.
@@ -205,20 +207,22 @@ const payment = await this.wait<{ chargeId: string }>("capture-payment", "paymen
 
 #### The watchdog alarm
 
-In addition to these precise alarms, the runtime sets a **30-minute watchdog alarm at the start of every run-loop iteration**, before delegating to the workflow definition. When an iteration ends cleanly—workflow terminal completion, suspend with a known **`wakeAt`**, or suspend waiting only on inbound events—the alarm is **cleared** or **replaced** by the next wake time when there is one. A **`wait`** with **no** `timeoutAt` has no step-specific alarm until an event arrives; the watchdog remains the backstop. The watchdog only fires if something goes wrong in the middle.
+The runtime sets a **30-minute watchdog alarm at the start of every run-loop iteration**, before calling the workflow definition. Context operations never move an existing alarm later while `next()` is in flight: they replace it only when their durable recovery deadline is earlier. This prevents a later sleep or wait timeout from postponing recovery if the definition call or its response is lost.
 
-The problem it guards against is a `run` step that gets stuck in the `running` state. Before the user's callback executes, the runtime durably writes `state = 'running'` to SQLite. That write is intentional: it ensures that a later replay does not try to start a second concurrent attempt for the same step. But it creates a gap:
+When `next()` successfully returns `suspended`, the runtime derives the active blockers from durable state. If every started run is an ancestor of a waiting sleep, wait, or retry, the watchdog is no longer needed: it is replaced with the exact earliest deadline, or deleted when the workflow is waiting only for inbound events. If a parallel started run is not explained by one of those blockers, the watchdog remains in place.
+
+The main problem it guards against is a `run` attempt that gets stuck in the `started` state. Before the user's callback executes, the runtime durably writes `state = 'started'` to SQLite. That write is intentional: it ensures that a later replay does not try to start a second concurrent attempt for the same step. But it creates a gap:
 
 ```
-1. Runtime writes state = 'running' to SQLite.   ← durable
+1. Runtime writes state = 'started' to SQLite.   ← durable
 2. User's callback starts executing.
 3. Durable Object is evicted or crashes.          ← no outcome recorded
-4. SQLite still shows state = 'running'.          ← step is stuck
+4. SQLite still shows state = 'started'.          ← attempt is stuck
 ```
 
-At this point there is no sleep alarm, no retry alarm, and no wait-timeout alarm; nothing scheduled to wake the runtime back up. Without the watchdog the workflow would stall indefinitely. The watchdog fires 30 minutes later, calls back into the run loop, replays `execute()`, reaches the stuck step, re-runs the callback, and records a proper outcome.
+At this point there may be no sleep, retry, or wait-timeout deadline to wake the runtime. Without the watchdog the workflow could stall indefinitely. The watchdog calls back into the run loop, which replays `execute()`, recognizes the interrupted attempt, records it as failed, and schedules the normal retry backoff. The callback runs again only when that retry becomes due and the step still has attempts remaining.
 
-There is also a guard for the case where an alarm fires while the run loop is already active — for example, a sleep's precise alarm arriving while the loop is processing another step in the same Durable Object invocation. In that situation the alarm handler simply reschedules the watchdog for another 30 minutes rather than starting a second concurrent loop, keeping the safety net in place until the active loop finishes.
+There is also a guard for the case where an alarm fires while the run loop is already active. The alarm handler records that another replay is needed and reschedules the watchdog rather than starting a concurrent loop. Once the active `next()` call returns, the loop replays immediately; the replacement watchdog remains the durable fallback if that invocation disappears first.
 
 ## Why this exists
 
@@ -229,12 +233,6 @@ Cloudflare Workflows is a strong managed option, and for many use cases it is th
 3. Separation between workflow execution and external state synchronization
 4. Extension points for streaming, WebSockets, and custom lifecycle consumers
 5. Fewer surprises around long-lived execution and error handling
-
-### Definition compatibility
-
-One of the biggest concerns in long-running workflows is definition drift. A normal Worker request is typically bound to a single in-flight execution on one deployed version, but a Workflow is durable: it persists state and resumes across multiple executions over time. A workflow may start on one version of its definition and resume later after a deploy has changed or removed a step. That means the next invocation of the workflow entry point could repeat steps unsafely or leave the runtime in an invalid state.
-
-`workerflow` keeps definition selection simple: each runtime points at one definition entrypoint, and the input is the only per-instance payload pinned by `create(input)`. If a workflow needs version-aware behavior, model that explicitly in your input shape and keep old branches compatible until the long-lived instances that need them have completed.
 
 ### Keeping workflow execution separate from state projection
 
