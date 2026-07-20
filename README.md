@@ -42,7 +42,7 @@ import { WorkflowDefinition, WorkflowRuntime, type WorkflowCompletionEvent } fro
 export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
   protected readonly definition = this.ctx.exports.OrderWorkflowDefinition;
 
-  protected async completion(event: WorkflowCompletionEvent): Promise<void> {
+  protected async experimental_completion(event: WorkflowCompletionEvent): Promise<void> {
     // Completion delivery is at least once. Use event.id as the idempotency key
     // when updating another database or calling an external API.
     console.log("Order workflow finished", event);
@@ -106,13 +106,13 @@ From the Durable Object stub you can:
 - **`create(input)`** — Pins the workflow input in SQLite the **first** time the instance is initialized, then starts execution. The input argument is required unless **`TInput`** includes **`undefined`**. **No-op** if the workflow is already **completed**, **failed**, **cancelled**, or **paused**.
 - **`pause()`** — When status is **running**, moves to **paused**, clears alarms, and stops driving **`execute()`** until **`resume()`**. Inbound events are queued and applied when a matching **`wait`** runs again after resume.
 - **`resume()`** — When status is **paused**, moves to **running** and continues the loop. Throws if the workflow is not paused.
-- **`cancel(reason?)`** — Moves to terminal **cancelled** and stops workflow execution. If the runtime defines **`completion`**, it schedules an alarm for durable completion delivery; otherwise it clears the current alarm.
+- **`cancel(reason?)`** — Moves to terminal **cancelled** and stops workflow execution. If the runtime defines **`experimental_completion`**, it schedules an alarm for durable experimental_completion delivery; otherwise it clears the current alarm.
 
 New instances start in **`pending`**. The first **`create()`** call moves the instance through the durable **`initialized`** state before execution enters **`running`**.
 
 ### Completion handler
 
-Define the optional protected **`completion(event)`** method on the runtime to consume terminal workflow outcomes:
+Define the optional protected **`experimental_completion(event)`** method on the runtime to consume terminal workflow outcomes:
 
 ```ts
 type WorkflowCompletionEvent = {
@@ -122,9 +122,9 @@ type WorkflowCompletionEvent = {
 };
 ```
 
-Defining the method opts that runtime into completion delivery; it is a runtime consumer, not a method clients call through the Durable Object stub. The runtime durably records a pending delivery in the same transaction as the terminal status, then invokes the consumer. Returning acknowledges the event; throwing records the error and schedules another attempt with exponential backoff.
+Defining the method opts that runtime into experimental_completion delivery; it is a runtime consumer, not a method clients call through the Durable Object stub. The runtime durably records a pending delivery in the same transaction as the terminal status, then invokes the consumer. Returning acknowledges the event; throwing records the error and schedules another attempt with exponential backoff.
 
-Delivery is **at least once**: the same event can be delivered again if the Durable Object stops after the consumer's side effect succeeds but before the acknowledgement is recorded. **`event.id`** is stable across attempts and should be used as an idempotency key. Failed attempts continue to be retried until the consumer returns successfully, without changing the workflow's terminal status. Runtimes that do not define **`completion`** do not create delivery records or schedule delivery alarms.
+Delivery is **at least once**: the same event can be delivered again if the Durable Object stops after the consumer's side effect succeeds but before the acknowledgement is recorded. **`event.id`** is stable across attempts and should be used as an idempotency key. Failed attempts continue to be retried until the consumer returns successfully, without changing the workflow's terminal status. Runtimes that do not define **`experimental_completion`** do not create delivery records or schedule delivery alarms.
 
 ### Experimental introspection
 
@@ -143,7 +143,7 @@ The library separates concerns into two main layers:
 Each time the runtime advances, it calls `next()` on your `WorkflowDefinition`, which **runs `execute()` from the beginning again**. Steps that have already completed durably (`run`, elapsed `sleep`, resolved `wait`, and so on) **replay from stored state**: their callbacks are not re-invoked, and recorded results are returned as-is. New side effects happen only when the engine reaches a step that is not yet complete and the durable state allows that transition.
 
 > [!IMPORTANT]
-> **Do not swallow errors thrown by `run()`, `sleep()`, or `wait()`.** These helpers use internal errors to suspend or immediately resume workflow execution. If `execute()` or a surrounding `run()` callback catches one and returns normally, the runtime may interpret that as successful workflow completion even though a durable step is still waiting. Catch business errors inside the `run()` callback that owns the operation, and either handle them completely or rethrow them; do not place a broad `try`/`catch` around step-helper calls unless the caught error is rethrown.
+> **Do not swallow errors thrown by `run()`, `sleep()`, or `wait()`.** These helpers use internal errors to suspend or immediately resume workflow execution. If `execute()` or a surrounding `run()` callback catches one and returns normally, the runtime may interpret that as successful workflow experimental_completion even though a durable step is still waiting. Catch business errors inside the `run()` callback that owns the operation, and either handle them completely or rethrow them; do not place a broad `try`/`catch` around step-helper calls unless the caught error is rethrown.
 
 **Step ids must be unique** within one top-level **`execute()`** run (the same **`next()`** invocation): reuse the same id across **`run`**, **`sleep`**, or **`wait`** and the workflow fails fast.
 
@@ -153,7 +153,7 @@ Each time the runtime advances, it calls `next()` on your `WorkflowDefinition`, 
 
 The `WorkflowRuntime` Durable Object drives a **run loop** that repeatedly invokes `next()` until one of these happens:
 
-- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared. A workflow with a completion handler uses the alarm for durable terminal-outcome delivery until the handler acknowledges the event.
+- **Terminal**: `next()` reports the workflow is **done** (`completed` or `failed`), or the instance is **`cancelled`** via **`cancel()`** while the loop is idle or between iterations. The loop exits and the watchdog alarm is cleared. A workflow with a experimental_completion handler uses the alarm for durable terminal-outcome delivery until the handler acknowledges the event.
 - **Immediate resume**: `next()` asks to **continue immediately** (for example, so another step in the same logical “tick” can run). The loop continues without leaving the Durable Object invocation.
 - **Suspended**: `next()` asks to **suspend**—for example, a step is waiting on a **retry backoff**, a **sleep** until a future time, or a **wait** for an inbound event. This is only a control-flow result: the context operation has already persisted any required recovery alarm alongside the step state. The loop exits and relies on that alarm and/or an incoming event to call back into the run loop. A long **watchdog alarm** also exists as a safety net if progress stalls.
 
@@ -203,7 +203,7 @@ const payment = await this.wait<{ chargeId: string }>("capture-payment", "paymen
 });
 ```
 
-**Completion delivery.** When a workflow completes, fails, or is cancelled and its runtime defines **`completion`**, the pending delivery is stored before an immediate alarm is scheduled. Before invoking the handler, the runtime moves that alarm forward as a visibility timeout. A rejected handler is retried with exponential backoff; if the runtime stops while the handler is running, the visibility timeout makes the event eligible for redelivery.
+**Completion delivery.** When a workflow completes, fails, or is cancelled and its runtime defines **`experimental_completion`**, the pending delivery is stored before an immediate alarm is scheduled. Before invoking the handler, the runtime moves that alarm forward as a visibility timeout. A rejected handler is retried with exponential backoff; if the runtime stops while the handler is running, the visibility timeout makes the event eligible for redelivery.
 
 #### The watchdog alarm
 
@@ -254,13 +254,13 @@ export class OrderWorkflowDefinition extends WorkflowDefinition<{ orderId: strin
 
 This looks reasonable at first, but it creates an important failure-mode problem. If the business operation succeeds but projection exhausts its retries, projection failure can affect the workflow's outcome even though these are not necessarily the same concern.
 
-I think a cleaner design for terminal projection is to keep synchronization out of the definition and implement **`completion`** on the runtime instead:
+I think a cleaner design for terminal projection is to keep synchronization out of the definition and implement **`experimental_completion`** on the runtime instead:
 
 ```ts
 export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
   protected readonly definition = this.ctx.exports.OrderWorkflowDefinition;
 
-  protected async completion(event: WorkflowCompletionEvent): Promise<void> {
+  protected async experimental_completion(event: WorkflowCompletionEvent): Promise<void> {
     // Project the terminal workflow status; use event.id as an idempotency key because this may be retried.
   }
 }
@@ -268,7 +268,7 @@ export class OrderWorkflowRuntime extends WorkflowRuntime<{ orderId: string }> {
 
 The terminal status and pending delivery are recorded together. If projection fails, the runtime retries it independently without retroactively redefining the workflow's business outcome. Because delivery is at least once, the projection should make repeated calls with the same **`event.id`** safe—for example, by storing it in a column with a unique constraint.
 
-The **`completion`** API only covers terminal outcomes. Applications that need live, non-terminal projection can poll the experimental introspection APIs or implement another runtime extension. A scheduled reconciliation job can also be useful as an independent audit and repair mechanism alongside completion delivery.
+The **`experimental_completion`** API only covers terminal outcomes. Applications that need live, non-terminal projection can poll the experimental introspection APIs or implement another runtime extension. A scheduled reconciliation job can also be useful as an independent audit and repair mechanism alongside experimental_completion delivery.
 
 That is not the only valid approach, but I think it produces a better separation of concerns: the workflow runtime determines workflow outcome, and projection mechanisms consume that outcome.
 

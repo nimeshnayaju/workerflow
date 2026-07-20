@@ -17,7 +17,7 @@ export class TestCompletionWorkflowRuntime extends WorkflowRuntime {
 
   public override onStatusChange?: (status: Exclude<WorkflowStatus, "pending" | "initialized">) => void;
 
-  public override async completion(_event: WorkflowCompletionEvent): Promise<void> {}
+  public override async experimental_completion(_event: WorkflowCompletionEvent): Promise<void> {}
 }
 export class TestWorkflowDefinition extends WorkflowDefinition {
   async execute(): Promise<void> {}

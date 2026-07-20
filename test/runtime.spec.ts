@@ -1574,7 +1574,7 @@ describe("WorkflowRuntime", () => {
       }
     });
 
-    it("preserves completion delivery when cancelled during scheduler.wait", async () => {
+    it("preserves experimental_completion delivery when cancelled during scheduler.wait", async () => {
       const retryWait = Promise.withResolvers<void>();
       const waitSpy = vi.spyOn(scheduler, "wait").mockImplementation(() => retryWait.promise);
       const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -1583,9 +1583,9 @@ describe("WorkflowRuntime", () => {
           throw Object.assign(new Error("definition unavailable"), { retryable: true });
         })
       }));
-      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
-      const completionSpy = vi
-        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["experimental_completion"]>[0][] = [];
+      const experimental_completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "experimental_completion")
         .mockImplementation(async (event) => {
           receivedEvents.push(event);
         });
@@ -1605,7 +1605,7 @@ describe("WorkflowRuntime", () => {
         await runInDurableObject(stub, async (instance, state) => {
           expect(instance.getStatus()).toBe("cancelled");
           expect(definition).toHaveBeenCalledOnce();
-          expect(completionSpy).toHaveBeenCalledOnce();
+          expect(experimental_completionSpy).toHaveBeenCalledOnce();
           expect(receivedEvents).toHaveLength(1);
           expect(receivedEvents[0]).toMatchObject({ status: "cancelled" });
           const delivery = state.storage.sql
@@ -1618,7 +1618,7 @@ describe("WorkflowRuntime", () => {
         retryWait.resolve();
         waitSpy.mockRestore();
         warnSpy.mockRestore();
-        completionSpy.mockRestore();
+        experimental_completionSpy.mockRestore();
       }
     });
 
@@ -3009,8 +3009,8 @@ describe("WorkflowRuntime", () => {
     });
   });
 
-  describe("completion()", () => {
-    it("does not create a delivery or alarm when the runtime has no completion handler", async () => {
+  describe("experimental_completion()", () => {
+    it("does not create a delivery or alarm when the runtime has no experimental_completion handler", async () => {
       const stub = env.TEST_WORKFLOW_RUNTIME.getByName(crypto.randomUUID());
 
       await runInDurableObject(stub, async (instance, state) => {
@@ -3028,9 +3028,9 @@ describe("WorkflowRuntime", () => {
     });
 
     it("delivers and acknowledges a completed workflow outcome", async () => {
-      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
-      const completionSpy = vi
-        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["experimental_completion"]>[0][] = [];
+      const experimental_completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "experimental_completion")
         .mockImplementation(async (event) => {
           receivedEvents.push(event);
         });
@@ -3077,14 +3077,14 @@ describe("WorkflowRuntime", () => {
           expect(state.storage.sql.exec("SELECT event_id FROM workflow_event_deliveries").toArray()).toHaveLength(1);
         });
       } finally {
-        completionSpy.mockRestore();
+        experimental_completionSpy.mockRestore();
       }
     });
 
     it("keeps the workflow completed and retries a rejected delivery after eviction", async () => {
       const receivedEventIds: string[] = [];
-      const completionSpy = vi
-        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+      const experimental_completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "experimental_completion")
         .mockImplementation(async (event) => {
           receivedEventIds.push(event.id);
           if (receivedEventIds.length === 1) throw new Error("projection unavailable");
@@ -3100,7 +3100,7 @@ describe("WorkflowRuntime", () => {
             if (status !== "running") resolve(status);
           };
 
-          await instance.create({ workflow: "retry-completion" });
+          await instance.create({ workflow: "retry-experimental_completion" });
           await expect(promise).resolves.toBe("completed");
           await expect.poll(() => receivedEventIds.length).toBe(1);
 
@@ -3145,16 +3145,16 @@ describe("WorkflowRuntime", () => {
           expect(await state.storage.getAlarm()).toBeNull();
         });
       } finally {
-        completionSpy.mockRestore();
+        experimental_completionSpy.mockRestore();
       }
     });
 
-    it("redelivers after forced teardown while the completion handler is still running", async () => {
+    it("redelivers after forced teardown while the experimental_completion handler is still running", async () => {
       const firstDeliveryStarted = Promise.withResolvers<void>();
       const interruptedDelivery = Promise.withResolvers<never>();
-      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
-      const completionSpy = vi
-        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["experimental_completion"]>[0][] = [];
+      const experimental_completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "experimental_completion")
         .mockImplementation(async (event) => {
           receivedEvents.push(event);
           if (receivedEvents.length === 1) {
@@ -3167,7 +3167,7 @@ describe("WorkflowRuntime", () => {
         const objectName = crypto.randomUUID();
         let stub = env.TEST_COMPLETION_WORKFLOW_RUNTIME.getByName(objectName);
         let visibilityTimeoutAt = 0;
-        const input = { workflow: "interrupted-completion" };
+        const input = { workflow: "interrupted-experimental_completion" };
 
         await runInDurableObject(stub, async (instance, state) => {
           await instance.create(input);
@@ -3207,14 +3207,14 @@ describe("WorkflowRuntime", () => {
           expect(await state.storage.getAlarm()).toBeNull();
         });
       } finally {
-        completionSpy.mockRestore();
+        experimental_completionSpy.mockRestore();
       }
     });
 
     it("delivers failed and cancelled workflow outcomes", async () => {
-      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["completion"]>[0][] = [];
-      const completionSpy = vi
-        .spyOn(TestCompletionWorkflowRuntime.prototype, "completion")
+      const receivedEvents: Parameters<TestCompletionWorkflowRuntime["experimental_completion"]>[0][] = [];
+      const experimental_completionSpy = vi
+        .spyOn(TestCompletionWorkflowRuntime.prototype, "experimental_completion")
         .mockImplementation(async (event) => {
           receivedEvents.push(event);
         });
@@ -3272,10 +3272,10 @@ describe("WorkflowRuntime", () => {
           expect(await state.storage.getAlarm()).toBeNull();
         });
 
-        expect(completionSpy).toHaveBeenCalledTimes(2);
+        expect(experimental_completionSpy).toHaveBeenCalledTimes(2);
       } finally {
         executeSpy.mockRestore();
-        completionSpy.mockRestore();
+        experimental_completionSpy.mockRestore();
       }
     });
   });
